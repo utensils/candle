@@ -1,10 +1,10 @@
 [package]
-name = "candle-metal-kernels"
+name = "candle-metal-kernels-mold"
 version = "0.9.2"
 edition = "2021"
 
-description = "Metal kernels for Candle"
-repository = "https://github.com/huggingface/candle"
+description = "Metal kernels for Candle (mold fork with quantized matmul precision fix)"
+repository = "https://github.com/utensils/candle"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"

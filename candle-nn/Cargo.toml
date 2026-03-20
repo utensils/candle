@@ -1,5 +1,5 @@
 [package]
-name = "candle-nn"
+name = "candle-nn-mold"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

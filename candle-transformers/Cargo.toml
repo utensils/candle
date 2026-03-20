@@ -1,5 +1,5 @@
 [package]
-name = "candle-transformers"
+name = "candle-transformers-mold"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
