@@ -500,6 +500,31 @@ impl QTensor {
         })
     }
 
+    /// Quantize a CPU F32 tensor onto a target device.
+    ///
+    /// The source tensor is converted to F32 and flattened on CPU, then quantized
+    /// directly onto the target device's QStorage. This avoids creating a full F32
+    /// tensor on the target device, saving VRAM when re-quantizing LoRA-patched weights.
+    pub fn quantize_to_device(src: &Tensor, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = src.shape();
+        let block_size = dtype.block_size();
+        check_shape(shape, block_size)?;
+        let src_cpu = src.to_device(&Device::Cpu)?.to_dtype(crate::DType::F32)?.flatten_all()?;
+        let elem_count = shape.elem_count();
+        if !elem_count.is_multiple_of(block_size) {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+        let mut storage = device.qzeros(elem_count, dtype)?;
+        storage.quantize_onto(&src_cpu.storage())?;
+        Ok(Self {
+            storage,
+            shape: shape.clone(),
+        })
+    }
+
     pub fn quantize_imatrix(
         src: &Tensor,
         imatrix_weights: &[f32],
