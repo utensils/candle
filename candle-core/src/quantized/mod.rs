@@ -622,9 +622,29 @@ impl QTensor {
                 block_size
             )
         }
-        // storage is on the `dev`, src is on `cpu`
-        let mut storage = dev.qzeros(elem_count, dtype)?;
-        storage.quantize_onto(&src.storage())?;
+        // Quantize entirely on CPU first, then do a single device allocation
+        // via from_data. This avoids the double GPU allocation that occurred
+        // when qzeros + quantize_onto each allocated separate device buffers,
+        // causing VRAM fragmentation/leaks in CUDA's caching allocator.
+        let src_storage = match &*src.storage_and_layout().0 {
+            crate::Storage::Cpu(cpu) => cpu.as_slice::<f32>()?.to_vec(),
+            _ => crate::bail!("expected CPU storage for quantize_onto source"),
+        };
+        let mut cpu_qstorage = Device::Cpu.qzeros(elem_count, dtype)?;
+        if let QStorage::Cpu(storage) = &mut cpu_qstorage {
+            storage.from_float(&src_storage);
+        }
+        if dev.is_cpu() {
+            return Ok(Self {
+                storage: cpu_qstorage,
+                shape: shape.clone(),
+            });
+        }
+        // For GPU devices: get the quantized bytes from CPU, then load with
+        // a single device allocation via QStorage::from_data.
+        let data = cpu_qstorage.data()?;
+        let storage =
+            QStorage::from_data(std::borrow::Cow::from(data), dev, dtype)?;
         Ok(Self {
             storage,
             shape: shape.clone(),
