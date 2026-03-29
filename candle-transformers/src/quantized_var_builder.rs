@@ -32,6 +32,21 @@ impl VarBuilder {
         })
     }
 
+    /// Build a VarBuilder from a pre-built HashMap of QTensors.
+    ///
+    /// This is useful when you need to modify tensors after loading (e.g. applying
+    /// LoRA patches to dequantized weights) before passing them to a model constructor.
+    pub fn from_qtensors(
+        data: std::collections::HashMap<String, Arc<QTensor>>,
+        device: &Device,
+    ) -> Self {
+        Self {
+            data: Arc::new(data),
+            path: Vec::new(),
+            device: device.clone(),
+        }
+    }
+
     pub fn from_gguf_buffer(buffer: &[u8], device: &Device) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(buffer);
         let content = candle::quantized::gguf_file::Content::read(&mut cursor)?;
