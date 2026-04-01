@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish candle-metal-kernels-mold
-        run: cargo publish --manifest-path candle-metal-kernels/Cargo.toml --no-verify
+        run: cargo publish --manifest-path candle-metal-kernels/Cargo.toml --no-verify || echo "Already published or skipped"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -26,7 +26,7 @@ jobs:
         run: sleep 30
 
       - name: Publish candle-core-mold
-        run: cargo publish --manifest-path candle-core/Cargo.toml --no-verify
+        run: cargo publish --manifest-path candle-core/Cargo.toml --no-verify || echo "Already published or skipped"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -34,7 +34,7 @@ jobs:
         run: sleep 30
 
       - name: Publish candle-nn-mold
-        run: cargo publish -p candle-nn-mold --no-verify
+        run: cargo publish -p candle-nn-mold --no-verify || echo "Already published or skipped"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -42,6 +42,6 @@ jobs:
         run: sleep 30
 
       - name: Publish candle-transformers-mold
-        run: cargo publish -p candle-transformers-mold --no-verify
+        run: cargo publish -p candle-transformers-mold --no-verify || echo "Already published or skipped"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
