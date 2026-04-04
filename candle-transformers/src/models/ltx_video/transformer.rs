@@ -907,6 +907,10 @@ pub struct LtxVideoTransformer3DModel {
     proj_out: nn::Linear,
     config: LtxVideoTransformer3DModelConfig,
     skip_block_list: Vec<usize>,
+    /// Timestep scaling factor (1000.0 for LTX Video, matching Python's
+    /// `timestep_scale_multiplier`). Applied to the input timestep before
+    /// computing the sinusoidal embedding.
+    timestep_scale_multiplier: f64,
 }
 
 impl LtxVideoTransformer3DModel {
@@ -968,6 +972,7 @@ impl LtxVideoTransformer3DModel {
             proj_out,
             config: config.clone(),
             skip_block_list: Vec::new(),
+            timestep_scale_multiplier: 1000.0,
         })
     }
 
@@ -998,7 +1003,12 @@ impl LtxVideoTransformer3DModel {
 
         let hidden_states = self.proj_in.forward(&hidden_states)?;
 
-        let timestep = timestep.flatten_all()?.to_dtype(model_dtype)?;
+        // Scale timestep by multiplier (1000.0) before computing sinusoidal embedding.
+        // The model receives raw sigma (0-1) and needs to map to embedding range (0-1000).
+        let timestep = timestep
+            .flatten_all()?
+            .to_dtype(model_dtype)?
+            .affine(self.timestep_scale_multiplier, 0.0)?;
 
         let (temb, embedded_timestep) = self.time_embed.forward(&timestep)?;
 
