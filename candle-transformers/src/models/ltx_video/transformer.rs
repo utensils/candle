@@ -466,18 +466,31 @@ impl LtxVideoRotaryPosEmbed {
         height: usize,
         width: usize,
         rope_interpolation_scale: Option<(f64, f64, f64)>,
+        video_coords: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let device = hidden_states.device();
         let batch_size = hidden_states.dim(0)?;
 
-        let grid = self.prepare_video_coords(
-            batch_size,
-            num_frames,
-            height,
-            width,
-            rope_interpolation_scale,
-            device,
-        )?;
+        let grid = if let Some(coords) = video_coords {
+            // Normalize external video coordinates by base sizes (matching Python reference).
+            let base_f = self.base_num_frames as f64;
+            let base_h = self.base_height as f64;
+            let base_w = self.base_width as f64;
+            let cf = coords.i((.., .., 0))?.to_dtype(DType::F32)?.affine(1.0 / base_f, 0.0)?;
+            let ch = coords.i((.., .., 1))?.to_dtype(DType::F32)?.affine(1.0 / base_h, 0.0)?;
+            let cw = coords.i((.., .., 2))?.to_dtype(DType::F32)?.affine(1.0 / base_w, 0.0)?;
+            Tensor::stack(&[cf, ch, cw], candle::D::Minus1)?
+        } else {
+            // Fall back to internally-computed coordinates (normalized by base sizes).
+            self.prepare_video_coords(
+                batch_size,
+                num_frames,
+                height,
+                width,
+                rope_interpolation_scale,
+                device,
+            )?
+        };
 
         let steps = self.dim / 6;
         let dtype = DType::F32;
@@ -977,6 +990,7 @@ impl LtxVideoTransformer3DModel {
         height: usize,
         width: usize,
         rope_interpolation_scale: Option<(f64, f64, f64)>,
+        video_coords: Option<&Tensor>,
     ) -> Result<Tensor> {
         let model_dtype = self.proj_in.weight().dtype();
         let hidden_states = hidden_states.to_dtype(model_dtype)?;
@@ -1009,6 +1023,7 @@ impl LtxVideoTransformer3DModel {
             height,
             width,
             rope_interpolation_scale,
+            video_coords,
         )?;
 
         let mut hidden_states = hidden_states;
