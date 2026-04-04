@@ -1021,26 +1021,26 @@ impl LtxVideoUpBlock3d {
             None
         };
 
-        let upsamplers = if spatiotemporal_scale {
-            Some(vec![LtxVideoUpsampler3d::new(
+        // Only create upsamplers if upsampling is needed.
+        // Try to load from weights; if not present, skip (v0.9 non-scaling blocks have none).
+        let upsamplers = {
+            let stride = if spatiotemporal_scale {
+                (2, 2, 2)
+            } else {
+                (1, 2, 2)
+            };
+            match LtxVideoUpsampler3d::new(
                 out_channels * up_scale_factor,
                 out_channels,
-                (2, 2, 2),
+                stride,
                 is_causal,
                 upsampler_residual,
                 up_scale_factor,
                 vb.pp("upsamplers.0"),
-            )?])
-        } else {
-            Some(vec![LtxVideoUpsampler3d::new(
-                out_channels * up_scale_factor,
-                out_channels,
-                (1, 2, 2),
-                is_causal,
-                upsampler_residual,
-                up_scale_factor,
-                vb.pp("upsamplers.0"),
-            )?])
+            ) {
+                Ok(up) => Some(vec![up]),
+                Err(_) => None, // No upsampler in weights (e.g., v0.9 non-scaling block)
+            }
         };
 
         let mut resnets = Vec::with_capacity(num_layers);
@@ -1331,10 +1331,9 @@ impl LtxVideoDecoder3d {
 
         for i in 0..n {
             let output_channel = boc[i] / upf[i];
-            let input_channel = output_channel;
 
             let ub = LtxVideoUpBlock3d::new(
-                input_channel,
+                current_channels,
                 output_channel,
                 lpb[i + 1],
                 0.0,
