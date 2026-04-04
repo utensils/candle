@@ -1482,7 +1482,7 @@ impl LtxVideoDecoder3d {
 
 #[derive(Debug, Clone)]
 pub struct AutoencoderKLLtxVideo {
-    pub encoder: LtxVideoEncoder3d,
+    pub encoder: Option<LtxVideoEncoder3d>,
     pub decoder: LtxVideoDecoder3d,
     pub quant_conv: Option<LtxVideoCausalConv3d>,
     pub post_quant_conv: Option<LtxVideoCausalConv3d>,
@@ -1522,6 +1522,8 @@ impl AutoencoderKLLtxVideo {
             .map(|s| DownsampleType::parse(s))
             .collect();
 
+        // Encoder is optional — txt2vid only needs the decoder.
+        // Fail gracefully if encoder weights are missing or incompatible.
         let encoder = LtxVideoEncoder3d::new(
             config.in_channels,
             config.latent_channels,
@@ -1534,7 +1536,7 @@ impl AutoencoderKLLtxVideo {
             config.resnet_eps,
             config.is_causal,
             vb.pp("encoder"),
-        )?;
+        );
 
         let quant_conv = LtxVideoCausalConv3d::new(
             config.latent_channels * 2,
@@ -1589,7 +1591,7 @@ impl AutoencoderKLLtxVideo {
         };
 
         Ok(Self {
-            encoder,
+            encoder: encoder.ok(),
             decoder,
             quant_conv,
             post_quant_conv,
@@ -1774,7 +1776,7 @@ impl AutoencoderKLLtxVideo {
             return self.tiled_encode(x, train);
         }
 
-        let mut h = self.encoder.forward(x, train)?;
+        let mut h = self.encoder.as_ref().expect("encoder required for encode()").forward(x, train)?;
         if let Some(ref qc) = self.quant_conv {
             h = qc.forward(&h)?;
         }
@@ -1917,7 +1919,7 @@ impl AutoencoderKLLtxVideo {
                 let h_end = (i + self.tile_sample_min_height).min(height);
                 let w_end = (j + self.tile_sample_min_width).min(width);
                 let tile = x.i((.., .., .., i..h_end, j..w_end))?;
-                let mut enc = self.encoder.forward(&tile, train)?;
+                let mut enc = self.encoder.as_ref().expect("encoder required for encode()").forward(&tile, train)?;
                 if let Some(ref qc) = self.quant_conv {
                     enc = qc.forward(&enc)?;
                 }
@@ -2045,7 +2047,7 @@ impl AutoencoderKLLtxVideo {
             {
                 self.tiled_encode(&tile, train)?
             } else {
-                let mut h = self.encoder.forward(&tile, train)?;
+                let mut h = self.encoder.as_ref().expect("encoder required for encode()").forward(&tile, train)?;
                 if let Some(ref qc) = self.quant_conv {
                     h = qc.forward(&h)?;
                 }
