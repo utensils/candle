@@ -1,6 +1,6 @@
 [package]
 name = "candle-metal-kernels-mold"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 
 description = "Metal kernels for Candle (mold fork with quantized matmul precision fix)"
