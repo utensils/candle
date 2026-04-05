@@ -1005,8 +1005,11 @@ impl LtxVideoUpBlock3d {
         up_scale_factor: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
+        // conv_in is optional — in v0.9.5 diffusers format, the upsampler handles
+        // the channel transition directly (e.g., 1024→512 via upsampler conv).
+        // Only present in some weight formats that use a separate resnet for channel adaptation.
         let conv_in = if in_channels != out_channels {
-            Some(LtxVideoResnetBlock3d::new(
+            LtxVideoResnetBlock3d::new(
                 in_channels,
                 out_channels,
                 dropout,
@@ -1016,7 +1019,8 @@ impl LtxVideoUpBlock3d {
                 inject_noise,
                 timestep_conditioning,
                 vb.pp("conv_in"),
-            )?)
+            )
+            .ok()
         } else {
             None
         };
@@ -1404,7 +1408,7 @@ impl LtxVideoDecoder3d {
         let out_c = c / (pt * p * p);
         let x = x.reshape(&[b, out_c, pt, p, p, f, h, w])?;
 
-        // permute(0, 1, 5, 2, 6, 4, 7, 3) -> [B, C, F, pt, H, p_h, W, p_w]
+        // permute(0, 1, 5, 2, 6, 4, 7, 3) -> [B, C, F, pt, H, p, W, p]
         let x = x.permute(vec![0, 1, 5, 2, 6, 4, 7, 3])?;
         let x = x.contiguous()?;
 
