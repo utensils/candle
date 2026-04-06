@@ -15,7 +15,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.9.5"
+version = "0.9.6"
 edition = "2021"
 description = "Minimalist ML framework (mold fork with LTX Video models, Metal fixes)."
 repository = "https://github.com/utensils/candle"
