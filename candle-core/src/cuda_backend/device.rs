@@ -38,6 +38,7 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    pub(crate) blas_lt: Arc<cudarc::cublaslt::CudaBlasLT>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
 }
@@ -254,6 +255,7 @@ impl CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let blas_lt = cudarc::cublaslt::CudaBlasLT::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -263,6 +265,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -278,6 +281,7 @@ impl BackendDevice for CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let blas_lt = cudarc::cublaslt::CudaBlasLT::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -287,6 +291,7 @@ impl BackendDevice for CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

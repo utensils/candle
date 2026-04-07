@@ -374,10 +374,15 @@ impl SimpleBackend for SafeTensorWithRouting<'_> {
             }
             .bt()
         })?;
-        let tensor = self.safetensors[*index]
-            .tensor(path)?
-            .load(dev)?
-            .to_dtype(dtype)?;
+        let tensor = self.safetensors[*index].tensor(path)?.load(dev)?;
+        // For FP8 "manual cast" loading: preserve native dtypes.
+        // F8E4M3 weights stay as F8E4M3; BF16/F16 biases and norms stay at their
+        // native precision (casting BF16→F8E4M3 would destroy norm/bias accuracy).
+        let tensor = if dtype == DType::F8E4M3 && tensor.dtype() != DType::F8E4M3 {
+            tensor.to_dtype(DType::BF16)?
+        } else {
+            tensor.to_dtype(dtype)?
+        };
         if tensor.shape() != &s {
             Err(candle::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {path}"),
