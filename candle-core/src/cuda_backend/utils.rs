@@ -57,9 +57,7 @@ pub trait Map2 {
             (S::F32(s1), S::F32(s2)) => S::F32(self.f(s1, l1, s2, l2, d)?),
             (S::F64(s1), S::F64(s2)) => S::F64(self.f(s1, l1, s2, l2, d)?),
             (S::F8E4M3(s1), S::F8E4M3(s2)) => S::F8E4M3(self.f(s1, l1, s2, l2, d)?),
-            _ => {
-                Err(CudaError::InternalError("dtype mismatch in binary op"))?
-            }
+            _ => Err(CudaError::InternalError("dtype mismatch in binary op"))?,
         };
         Ok(out)
     }

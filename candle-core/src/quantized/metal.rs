@@ -42,10 +42,7 @@ impl QMetalStorage {
 
         // Check if this dtype is supported by GPU dequantize kernels
         let kernel_dtype: candle_metal_kernels::GgmlDType = self.dtype.into();
-        let gpu_supported = !matches!(
-            self.dtype,
-            GgmlDType::Q8_1 | GgmlDType::Q8K
-        );
+        let gpu_supported = !matches!(self.dtype, GgmlDType::Q8_1 | GgmlDType::Q8K);
 
         if !gpu_supported {
             // Fall back to CPU dequantize for unsupported types

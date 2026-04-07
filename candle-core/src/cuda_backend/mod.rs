@@ -1420,24 +1420,24 @@ fn gemm_fp8_to_bf16(
     let stream = blas_lt.stream();
     let handle = *blas_lt.handle();
 
-    let (a_rows, a_cols) = if transa { (k as u64, n as u64) } else { (n as u64, k as u64) };
-    let (b_rows, b_cols) = if transb { (m as u64, k as u64) } else { (k as u64, m as u64) };
+    let (a_rows, a_cols) = if transa {
+        (k as u64, n as u64)
+    } else {
+        (n as u64, k as u64)
+    };
+    let (b_rows, b_cols) = if transb {
+        (m as u64, k as u64)
+    } else {
+        (k as u64, m as u64)
+    };
 
     // Create matrix layouts: A and B are FP8, C is BF16
-    let a_layout = lt::create_matrix_layout(
-        lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
-        a_rows,
-        a_cols,
-        lda,
-    )
-    .w()?;
-    let b_layout = lt::create_matrix_layout(
-        lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
-        b_rows,
-        b_cols,
-        ldb,
-    )
-    .w()?;
+    let a_layout =
+        lt::create_matrix_layout(lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, a_rows, a_cols, lda)
+            .w()?;
+    let b_layout =
+        lt::create_matrix_layout(lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, b_rows, b_cols, ldb)
+            .w()?;
     let c_layout = lt::create_matrix_layout(
         lt_sys::cudaDataType_t::CUDA_R_16BF,
         n as u64,
@@ -2507,9 +2507,8 @@ impl BackendStorage for CudaStorage {
                 let lhs_fp8 = &lhs_fp8.slice(lhs_l.start_offset()..);
                 let rhs_fp8 = &rhs_fp8.slice(rhs_l.start_offset()..);
                 let mut out = unsafe { dev.alloc::<bf16>(elem_count)? };
-                match gemm_fp8_to_bf16(
-                    dev, (b, m, n, k), lhs_fp8, lhs_l, rhs_fp8, rhs_l, &mut out,
-                ) {
+                match gemm_fp8_to_bf16(dev, (b, m, n, k), lhs_fp8, lhs_l, rhs_fp8, rhs_l, &mut out)
+                {
                     Ok(()) => CudaStorageSlice::BF16(out),
                     Err(_) => {
                         // FP8 TN layout not available — cast to BF16 and use regular matmul.

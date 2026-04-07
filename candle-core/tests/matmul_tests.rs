@@ -265,12 +265,7 @@ test_device!(
 );
 test_device!(squeeze_mm, squeeze_mm_cpu, squeeze_mm_gpu, squeeze_mm_metal);
 test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
-test_device!(
-    matmul_fp8,
-    matmul_fp8_cpu,
-    matmul_fp8_gpu,
-    matmul_fp8_metal
-);
+test_device!(matmul_fp8, matmul_fp8_cpu, matmul_fp8_gpu, matmul_fp8_metal);
 test_device!(
     matmul_fp8_rect,
     matmul_fp8_rect_cpu,

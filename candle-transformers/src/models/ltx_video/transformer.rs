@@ -476,9 +476,18 @@ impl LtxVideoRotaryPosEmbed {
             let base_f = self.base_num_frames as f64;
             let base_h = self.base_height as f64;
             let base_w = self.base_width as f64;
-            let cf = coords.i((.., .., 0))?.to_dtype(DType::F32)?.affine(1.0 / base_f, 0.0)?;
-            let ch = coords.i((.., .., 1))?.to_dtype(DType::F32)?.affine(1.0 / base_h, 0.0)?;
-            let cw = coords.i((.., .., 2))?.to_dtype(DType::F32)?.affine(1.0 / base_w, 0.0)?;
+            let cf = coords
+                .i((.., .., 0))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_f, 0.0)?;
+            let ch = coords
+                .i((.., .., 1))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_h, 0.0)?;
+            let cw = coords
+                .i((.., .., 2))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_w, 0.0)?;
             Tensor::stack(&[cf, ch, cw], candle::D::Minus1)?
         } else {
             // Fall back to internally-computed coordinates (normalized by base sizes).
@@ -996,6 +1005,7 @@ impl LtxVideoTransformer3DModel {
         width: usize,
         rope_interpolation_scale: Option<(f64, f64, f64)>,
         video_coords: Option<&Tensor>,
+        skip_layer_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let model_dtype = self.proj_in.weight().dtype();
         let hidden_states = hidden_states.to_dtype(model_dtype)?;
@@ -1044,6 +1054,12 @@ impl LtxVideoTransformer3DModel {
                 continue;
             }
 
+            let original_hidden_states = if skip_layer_mask.is_some() {
+                Some(hidden_states.clone())
+            } else {
+                None
+            };
+
             hidden_states = block.forward(
                 &hidden_states,
                 &encoder_hidden_states,
@@ -1051,6 +1067,18 @@ impl LtxVideoTransformer3DModel {
                 image_rotary_emb,
                 encoder_attention_mask,
             )?;
+
+            if let (Some(mask), Some(orig)) = (skip_layer_mask, original_hidden_states) {
+                // The mask is [num_layers, batch]. A value of 1 means "skip"
+                // the processed output for this layer and keep the input state.
+                let m = mask.narrow(0, index, 1)?.flatten_all()?;
+                let batch = hidden_states.dim(0)?;
+                let m = m.reshape((batch, 1, 1))?.to_dtype(hidden_states.dtype())?;
+                let one_minus_m = m.affine(-1.0, 1.0)?;
+                hidden_states = hidden_states
+                    .broadcast_mul(&one_minus_m)?
+                    .broadcast_add(&orig.broadcast_mul(&m)?)?;
+            }
         }
 
         // Final modulation
@@ -1141,6 +1169,47 @@ mod tests {
         model.set_skip_block_list(vec![1]);
         assert_eq!(model.skip_block_list, vec![1]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_forward_accepts_skip_layer_mask() -> candle::Result<()> {
+        let device = Device::Cpu;
+        let config = LtxVideoTransformer3DModelConfig {
+            num_layers: 2,
+            attention_head_dim: 16,
+            num_attention_heads: 2,
+            cross_attention_dim: 32,
+            caption_channels: 32,
+            in_channels: 32,
+            out_channels: 32,
+            ..Default::default()
+        };
+
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = LtxVideoTransformer3DModel::new(&config, vb.pp("transformer"))?;
+
+        let hidden_states = Tensor::zeros((1, 4, 32), DType::F32, &device)?;
+        let encoder_hidden_states = Tensor::zeros((1, 4, 32), DType::F32, &device)?;
+        let timestep = Tensor::zeros((1,), DType::F32, &device)?;
+        let attention_mask = Tensor::ones((1, 4), DType::F32, &device)?;
+        let video_coords = Tensor::zeros((1, 4, 3), DType::F32, &device)?;
+        let skip_layer_mask = Tensor::zeros((2, 1), DType::F32, &device)?;
+
+        let out = model.forward(
+            &hidden_states,
+            &encoder_hidden_states,
+            &timestep,
+            Some(&attention_mask),
+            1,
+            2,
+            2,
+            None,
+            Some(&video_coords),
+            Some(&skip_layer_mask),
+        )?;
+
+        assert_eq!(out.dims3()?, (1, 4, 32));
         Ok(())
     }
 }

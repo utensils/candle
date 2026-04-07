@@ -321,11 +321,12 @@ pub fn call_dequantize_f32(
         GgmlDType::BF16 => "kernel_get_rows_bf16",
         GgmlDType::F32 => "kernel_get_rows_f32",
         GgmlDType::Q8_1 => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "dequantize"))
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "Q8_1",
+                "dequantize",
+            ))
         }
-        GgmlDType::Q8K => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "dequantize"))
-        }
+        GgmlDType::Q8K => return Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "dequantize")),
     };
 
     // Compute byte strides for the kernel
@@ -401,18 +402,18 @@ fn dtype_type_size(dtype: GgmlDType) -> usize {
     match dtype {
         GgmlDType::F32 => 4,
         GgmlDType::F16 | GgmlDType::BF16 => 2,
-        GgmlDType::Q4_0 => 18,   // 2 (delta) + 16 (qs)
-        GgmlDType::Q4_1 => 20,   // 2 (delta) + 2 (min) + 16 (qs)
-        GgmlDType::Q5_0 => 22,   // 2 (delta) + 4 (qh) + 16 (qs)
-        GgmlDType::Q5_1 => 24,   // 2 (delta) + 2 (min) + 4 (qh) + 16 (qs)
-        GgmlDType::Q8_0 => 34,   // 2 (delta) + 32 (qs)
-        GgmlDType::Q8_1 => 40,   // 4 (delta) + 4 (sum) + 32 (qs)
-        GgmlDType::Q2K => 84,    // block_q2_K
-        GgmlDType::Q3K => 110,   // block_q3_K
-        GgmlDType::Q4K => 144,   // block_q4_K
-        GgmlDType::Q5K => 176,   // block_q5_K
-        GgmlDType::Q6K => 210,   // block_q6_K
-        GgmlDType::Q8K => 292,   // block_q8_K
+        GgmlDType::Q4_0 => 18, // 2 (delta) + 16 (qs)
+        GgmlDType::Q4_1 => 20, // 2 (delta) + 2 (min) + 16 (qs)
+        GgmlDType::Q5_0 => 22, // 2 (delta) + 4 (qh) + 16 (qs)
+        GgmlDType::Q5_1 => 24, // 2 (delta) + 2 (min) + 4 (qh) + 16 (qs)
+        GgmlDType::Q8_0 => 34, // 2 (delta) + 32 (qs)
+        GgmlDType::Q8_1 => 40, // 4 (delta) + 4 (sum) + 32 (qs)
+        GgmlDType::Q2K => 84,  // block_q2_K
+        GgmlDType::Q3K => 110, // block_q3_K
+        GgmlDType::Q4K => 144, // block_q4_K
+        GgmlDType::Q5K => 176, // block_q5_K
+        GgmlDType::Q6K => 210, // block_q6_K
+        GgmlDType::Q8K => 292, // block_q8_K
     }
 }
 

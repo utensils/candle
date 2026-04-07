@@ -509,7 +509,10 @@ impl QTensor {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src_cpu = src.to_device(&Device::Cpu)?.to_dtype(crate::DType::F32)?.flatten_all()?;
+        let src_cpu = src
+            .to_device(&Device::Cpu)?
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {
             crate::bail!(
@@ -643,8 +646,7 @@ impl QTensor {
         // For GPU devices: get the quantized bytes from CPU, then load with
         // a single device allocation via QStorage::from_data.
         let data = cpu_qstorage.data()?;
-        let storage =
-            QStorage::from_data(std::borrow::Cow::from(data), dev, dtype)?;
+        let storage = QStorage::from_data(data, dev, dtype)?;
         Ok(Self {
             storage,
             shape: shape.clone(),
