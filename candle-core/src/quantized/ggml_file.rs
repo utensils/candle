@@ -125,7 +125,27 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
 ) -> Result<super::QTensor> {
     let raw_data_ptr = raw_data.as_ptr();
     let n_blocks = size_in_bytes / std::mem::size_of::<T>();
-    let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
+    let owned = if (raw_data_ptr as usize) % std::mem::align_of::<T>() == 0 {
+        None
+    } else {
+        // Some GGUF checkpoints expose tensor payloads at byte offsets that are
+        // not aligned for their quantized block type. Copy once into aligned
+        // storage before interpreting the bytes as blocks.
+        let mut aligned = Vec::<T>::with_capacity(n_blocks);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw_data_ptr,
+                aligned.as_mut_ptr() as *mut u8,
+                size_in_bytes,
+            );
+            aligned.set_len(n_blocks);
+        }
+        Some(aligned)
+    };
+    let data = match &owned {
+        Some(aligned) => aligned.as_slice(),
+        None => unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) },
+    };
     let data: QStorage = match device {
         Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
