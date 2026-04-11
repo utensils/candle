@@ -512,7 +512,12 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
         dtype: DType,
         dev: &Device,
     ) -> Result<Tensor> {
-        let tensor = self.load(name, dev)?.to_dtype(dtype)?;
+        let tensor = self.load(name, dev)?;
+        let tensor = if dtype == DType::F8E4M3 && tensor.dtype() != DType::F8E4M3 {
+            tensor.to_dtype(DType::BF16)?
+        } else {
+            tensor.to_dtype(dtype)?
+        };
         if tensor.shape() != &s {
             Err(candle::Error::UnexpectedShape {
                 msg: format!("shape mismatch for {name}"),
@@ -525,7 +530,12 @@ impl SimpleBackend for candle::safetensors::MmapedSafetensors {
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
-        self.load(name, dev)?.to_dtype(dtype)
+        let tensor = self.load(name, dev)?;
+        if dtype == DType::F8E4M3 && tensor.dtype() != DType::F8E4M3 {
+            tensor.to_dtype(DType::BF16)
+        } else {
+            tensor.to_dtype(dtype)
+        }
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
