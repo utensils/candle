@@ -513,6 +513,16 @@ impl StableDiffusionConfig {
     pub fn build_scheduler(&self, n_steps: usize) -> Result<Box<dyn Scheduler>> {
         self.scheduler.build(n_steps)
     }
+
+    /// Read-only access to the UNet sub-configuration.
+    pub fn unet(&self) -> &unet_2d::UNet2DConditionModelConfig {
+        &self.unet
+    }
+
+    /// Read-only access to the autoencoder (VAE) sub-configuration.
+    pub fn autoencoder(&self) -> &vae::AutoEncoderKLConfig {
+        &self.autoencoder
+    }
 }
 
 pub fn build_clip_transformer<P: AsRef<std::path::Path>>(
