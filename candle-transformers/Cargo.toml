@@ -9,6 +9,9 @@ categories.workspace = true
 license.workspace = true
 readme = "README.md"
 
+[lib]
+name = "candle_transformers"
+
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
@@ -33,3 +36,4 @@ cudnn = ["candle/cudnn", "candle-nn/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]
 metal = ["candle/metal", "candle-nn/metal"]
+metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels"]
