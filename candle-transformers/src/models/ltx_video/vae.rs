@@ -5,6 +5,8 @@
 // - Removed debug print statements (use tracing instead)
 // - Simplified for integration with mold inference engine
 
+#![allow(clippy::too_many_arguments)]
+
 use candle::{bail, DType, IndexOp, Module, Result, Tensor};
 use candle_nn::{
     ops, Activation, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig, Linear, RmsNorm, VarBuilder,

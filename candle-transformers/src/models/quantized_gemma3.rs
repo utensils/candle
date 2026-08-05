@@ -269,7 +269,7 @@ impl ModelWeights {
             .iter()
             .find(|p| {
                 ct.metadata
-                    .contains_key(&format!("{}.attention.head_count", p))
+                    .contains_key(&format!("{p}.attention.head_count"))
             })
             .copied()
             .unwrap_or("gemma3");

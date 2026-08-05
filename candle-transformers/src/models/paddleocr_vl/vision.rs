@@ -1004,9 +1004,9 @@ impl VisionModel {
                 "  patch_embedding+pos output shape: {:?}",
                 hidden_states.dims()
             );
-            eprintln!("  embeddings[0,:10]: {:?}", first_10);
+            eprintln!("  embeddings[0,:10]: {first_10:?}");
             let mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
-            eprintln!("  embeddings mean: {:.6}", mean);
+            eprintln!("  embeddings mean: {mean:.6}");
         }
 
         // Compute rotary embeddings
@@ -1028,10 +1028,7 @@ impl VisionModel {
                 let hs_f32 = hidden_states.to_dtype(DType::F32)?;
                 let first_10: Vec<f32> = hs_f32.i(0)?.narrow(0, 0, 10)?.to_vec1()?;
                 let mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
-                eprintln!(
-                    "  after layer {}: mean={:.6}, [0,:10]={:?}",
-                    i, mean, first_10
-                );
+                eprintln!("  after layer {i}: mean={mean:.6}, [0,:10]={first_10:?}");
             }
         }
 
@@ -1042,10 +1039,7 @@ impl VisionModel {
             let hs_f32 = hidden_states.to_dtype(DType::F32)?;
             let first_10: Vec<f32> = hs_f32.i(0)?.narrow(0, 0, 10)?.to_vec1()?;
             let mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
-            eprintln!(
-                "  after post_layernorm: mean={:.6}, [0,:10]={:?}",
-                mean, first_10
-            );
+            eprintln!("  after post_layernorm: mean={mean:.6}, [0,:10]={first_10:?}");
         }
 
         // Project to text model dimension with proper 2×2 spatial merging
@@ -1199,7 +1193,7 @@ impl VisionModel {
                 hidden_states = layer.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
                 if i == 13 || i == 26 {
                     exports.insert(
-                        format!("layer_{}_output", i),
+                        format!("layer_{i}_output"),
                         hidden_states.to_dtype(DType::F32)?,
                     );
                 }

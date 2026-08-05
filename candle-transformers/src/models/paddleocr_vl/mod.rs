@@ -348,8 +348,7 @@ impl PaddleOCRVLModel {
 
                 if num_tokens != num_embeddings {
                     return Err(candle::Error::Msg(format!(
-                        "Image {} has {} placeholder tokens but {} embeddings",
-                        img_idx, num_tokens, num_embeddings
+                        "Image {img_idx} has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                     )));
                 }
 
@@ -466,8 +465,7 @@ impl PaddleOCRVLModel {
 
                 if num_tokens != num_embeddings {
                     return Err(candle::Error::Msg(format!(
-                        "Image {} has {} placeholder tokens but {} embeddings",
-                        img_idx, num_tokens, num_embeddings
+                        "Image {img_idx} has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                     )));
                 }
 
@@ -755,8 +753,7 @@ impl PaddleOCRVLModel {
 
             if num_tokens != num_embeddings {
                 return Err(candle::Error::Msg(format!(
-                    "Video has {} placeholder tokens but {} embeddings",
-                    num_tokens, num_embeddings
+                    "Video has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                 )));
             }
 

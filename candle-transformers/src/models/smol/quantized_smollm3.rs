@@ -89,7 +89,7 @@ impl QuantizedConfig {
                 .and_then(|v| v.to_u32().ok())
                 .map(|v| v as usize)
                 .ok_or_else(|| {
-                    candle::Error::Msg(format!("Missing or invalid metadata key: {}", key))
+                    candle::Error::Msg(format!("Missing or invalid metadata key: {key}"))
                 })
         };
 
@@ -99,7 +99,7 @@ impl QuantizedConfig {
                 .and_then(|v| v.to_f32().ok())
                 .map(|v| v as f64)
                 .ok_or_else(|| {
-                    candle::Error::Msg(format!("Missing or invalid metadata key: {}", key))
+                    candle::Error::Msg(format!("Missing or invalid metadata key: {key}"))
                 })
         };
 
