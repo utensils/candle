@@ -37,7 +37,58 @@ impl QMetalStorage {
         &self.buffer
     }
 
-    pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
+    /// Dequantize a quantized tensor to F32 using GPU kernels.
+    ///
+    /// Uses Metal `kernel_get_rows_*` to dequantize directly on GPU, avoiding
+    /// the CPU roundtrip. Falls back to CPU for unsupported dtypes (Q8_1, Q8K).
+    fn dequantize_on_gpu(&self, n_rows: usize, n_cols: usize) -> Result<MetalStorage> {
+        let elem_count = n_rows * n_cols;
+
+        // Check if this dtype is supported by GPU dequantize kernels
+        let kernel_dtype: candle_metal_kernels::GgmlDType = self.dtype.into();
+        let gpu_supported = !matches!(self.dtype, GgmlDType::Q8_1 | GgmlDType::Q8K);
+
+        if !gpu_supported {
+            // Fall back to CPU dequantize for unsupported types
+            return self.dequantize_cpu(elem_count);
+        }
+
+        // Allocate F32 output buffer on GPU
+        let output_size = elem_count * 4; // f32 = 4 bytes
+        let dst_buffer = self.device.allocate_zeros(output_size)?;
+
+        // Create sequential index buffer [0, 1, ..., n_rows-1] as i32
+        let indices: Vec<i32> = (0..n_rows as i32).collect();
+        let indices_buffer = self.device.new_buffer_with_data(&indices)?;
+
+        // Dispatch the GPU dequantize kernel
+        {
+            let encoder = self.device.command_encoder()?;
+            candle_metal_kernels::call_dequantize_f32(
+                self.device.device(),
+                &encoder,
+                self.device.kernels(),
+                kernel_dtype,
+                n_rows,
+                n_cols,
+                &self.buffer,
+                &dst_buffer,
+                &indices_buffer,
+            )
+            .map_err(|e| crate::Error::Metal(e.into()))?;
+            // encoder dropped here → status returns to Available
+        }
+
+        Ok(MetalStorage::new(
+            dst_buffer,
+            self.device.clone(),
+            elem_count,
+            DType::F32,
+        ))
+    }
+
+    /// CPU-based dequantization fallback for dtypes not supported by GPU kernels.
+    fn dequantize_cpu(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 
         let buffer = self
@@ -131,6 +182,11 @@ impl QMetalStorage {
         ))
     }
 
+    pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
+        // Treat as a single row for GPU dequantization
+        self.dequantize_on_gpu(1, elem_count)
+    }
+
     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
         // Quantization only happens on CPU for now.
         let src = src.to_cpu::<f32>()?;
@@ -221,6 +277,12 @@ impl QMetalStorage {
         self.buffer.length()
     }
 
+    /// Quantized matmul via per-operation dequantization.
+    ///
+    /// Metal's native quantized matmul kernels produce incorrect results for
+    /// diffusion models (precision errors compound across denoising iterations).
+    /// Instead, we dequantize the weight to F32, use standard Metal GEMM, and
+    /// free the temporary F32 copy. Peak extra memory: one layer (~50-200MB).
     pub fn embedding(
         &self,
         rows: usize,
@@ -279,163 +341,62 @@ impl QMetalStorage {
         ))
     }
 
-    fn fwd_mv(
-        &self,
-        self_shape: &Shape,
-        storage: &MetalStorage,
-        layout: &crate::Layout,
-    ) -> Result<(MetalStorage, Shape)> {
-        use crate::MetalError;
-
-        if !layout.is_contiguous() {
-            crate::bail!("input tensor is not contiguous {layout:?}")
-        }
-        let src_shape = layout.shape();
-        // self is transposed so n is first then k.
-        if src_shape.rank() < 2 {
-            crate::bail!("input tensor has only one dimension {layout:?}")
-        }
-        let (n, k) = self_shape.dims2()?;
-        let mut dst_shape = src_shape.dims().to_vec();
-
-        // We always use a single batch dimension and stack all the tensors in the batch on the
-        // second dimension as the implementation in candle-metal-kernels doesn't handle batch
-        // properly.
-        let m = match dst_shape.len() {
-            3 => dst_shape[0] * dst_shape[1],
-            2 => dst_shape[0],
-            n => crate::bail!("Invalid rank {n} for quantized matmul metal"),
-        };
-        let last_k = dst_shape.pop().unwrap();
-        if last_k != k {
-            crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
-        }
-        dst_shape.push(n);
-        let dst_shape = Shape::from(dst_shape);
-        let device = storage.device().clone();
-        let dst = device
-            .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
-            .with_label("qmatmul")
-            .build()?;
-        let encoder = device.command_encoder()?;
-        // In some cases it would be better to use the mm variant, though it has its drawbacks
-        // around memory alignment.
-        for batch_id in 0..m {
-            candle_metal_kernels::call_quantized_matmul_mv_t(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                self.dtype.into(),
-                (1, 1, n, k),
-                storage.buffer(),
-                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
-                &self.buffer,
-                batch_id * n * DType::F32.size_in_bytes(),
-                &dst,
-            )
-            .map_err(MetalError::from)?;
-        }
-        let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
-        Ok((dst_storage, dst_shape))
-    }
-
     pub fn fwd(
         &self,
         self_shape: &Shape,
         storage: &MetalStorage,
         layout: &crate::Layout,
     ) -> Result<(MetalStorage, Shape)> {
-        use crate::MetalError;
-
         if !layout.is_contiguous() {
             crate::bail!("input tensor is not contiguous {layout:?}")
         }
         let src_shape = layout.shape();
-        // self is transposed so n is first then k.
         if src_shape.rank() < 2 {
             crate::bail!("input tensor has only one dimension {layout:?}")
         }
+
+        // self_shape is [n, k] (weight is transposed).
         let n = self_shape.dim(D::Minus2)?;
         let k = self_shape.dim(D::Minus1)?;
-        let mut dst_shape = src_shape.dims().to_vec();
 
-        if src_shape.rank() < self_shape.rank() {
-            crate::bail!(
-                "input rank ({}) must be >= weight rank ({})",
-                src_shape.rank(),
-                self_shape.rank()
-            )
-        }
-
-        if src_shape.dim(D::Minus2)? == 1 {
-            return self.fwd_mv(self_shape, storage, layout);
-        }
-
-        let last_k = dst_shape.pop().unwrap();
+        // Validate input's last dim matches weight's k.
+        let last_k = src_shape.dim(D::Minus1)?;
         if last_k != k {
             crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
         }
-        dst_shape.push(n);
-        let dst_shape = Shape::from(dst_shape);
-        let device = storage.device().clone();
-        let dst = device
-            .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
-            .with_label("qmatmul")
-            .build()?;
-        let encoder = device.command_encoder()?;
+        // Dequantize weight [n, k] to F32 on GPU (no CPU roundtrip)
+        let deq_weight = self.dequantize_on_gpu(n, k)?;
+        let rhs_l = crate::Layout::contiguous_with_offset(self_shape, 0);
 
-        assert_eq!(storage.dtype(), DType::F32);
+        // Compute batch dimensions: everything except the last dim becomes batch.
+        // input: [..., m, k] @ weight^T: [n, k]^T = [..., m, n]
+        let m = src_shape.dim(D::Minus2)?;
+        let b: usize = src_shape.dims().iter().rev().skip(2).product();
+        let b = if b == 0 { 1 } else { b };
 
-        if self_shape.rank() > 4 {
-            crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
-        }
-        let src0_l = crate::Layout::contiguous(
-            [vec![1; 4 - self_shape.rank()], self_shape.dims().to_vec()].concat(),
-        );
-        let src0_stride = src0_l
-            .stride()
-            .iter()
-            .map(|x| {
-                (*x as f32 * (self.dtype.type_size() as f32 / self.dtype.block_size() as f32))
-                    as usize
-            })
-            .collect::<Vec<_>>();
+        // Transpose weight [n, k] -> use as [k, n] for standard matmul.
+        // Standard matmul: [m, k] @ [k, n] = [m, n]
+        // But our weight is [n, k], so we need transposed matmul.
+        // The BackendStorage::matmul does lhs @ rhs with given (b, m, n, k).
+        // It handles transposition via layout strides.
 
-        if src_shape.rank() > 4 {
-            crate::bail!("weight rank ({}) must be <= 4", src_shape.rank())
-        }
-        let src1_l = crate::Layout::contiguous(
-            [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
-        );
+        // Create transposed layout for weight: [n, k] with transposed strides
+        let rhs_t = rhs_l.transpose(0, 1)?;
 
-        candle_metal_kernels::call_quantized_matmul_mm_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            src0_l.dims(),
-            &src0_stride,
-            &self.buffer,
-            src1_l.dims(),
-            &src1_l
-                .stride()
-                .iter()
-                .map(|x| x * DType::F32.size_in_bytes())
-                .collect::<Vec<_>>(),
-            storage.buffer(),
-            src1_l.start_offset() * storage.dtype().size_in_bytes(),
-            dst_shape.dims(),
-            0,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
+        let result = storage.matmul(&deq_weight, (b, m, n, k), layout, &rhs_t)?;
 
-        let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
-        Ok((dst_storage, dst_shape))
+        // Sync to let Metal free the temporary dequantized buffer.
+        // Without this, async command dispatch accumulates hundreds of ~200MB
+        // temporary buffers (one per matmul) before any are freed, causing OOM.
+        drop(deq_weight);
+        self.device.wait_until_completed()?;
+
+        // Build output shape: [..., m, n]
+        let mut dst_dims = src_shape.dims().to_vec();
+        *dst_dims.last_mut().unwrap() = n;
+        let dst_shape = Shape::from(dst_dims);
+
+        Ok((result, dst_shape))
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
