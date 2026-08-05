@@ -476,9 +476,18 @@ impl LtxVideoRotaryPosEmbed {
             let base_f = self.base_num_frames as f64;
             let base_h = self.base_height as f64;
             let base_w = self.base_width as f64;
-            let cf = coords.i((.., .., 0))?.to_dtype(DType::F32)?.affine(1.0 / base_f, 0.0)?;
-            let ch = coords.i((.., .., 1))?.to_dtype(DType::F32)?.affine(1.0 / base_h, 0.0)?;
-            let cw = coords.i((.., .., 2))?.to_dtype(DType::F32)?.affine(1.0 / base_w, 0.0)?;
+            let cf = coords
+                .i((.., .., 0))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_f, 0.0)?;
+            let ch = coords
+                .i((.., .., 1))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_h, 0.0)?;
+            let cw = coords
+                .i((.., .., 2))?
+                .to_dtype(DType::F32)?
+                .affine(1.0 / base_w, 0.0)?;
             Tensor::stack(&[cf, ch, cw], candle::D::Minus1)?
         } else {
             // Fall back to internally-computed coordinates (normalized by base sizes).

@@ -5,9 +5,11 @@
 // - Removed debug print statements (use tracing instead)
 // - Simplified for integration with mold inference engine
 
+#![allow(clippy::too_many_arguments)]
+
 use candle::{bail, DType, IndexOp, Module, Result, Tensor};
 use candle_nn::{
-    Activation, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig, Linear, RmsNorm, VarBuilder, ops,
+    ops, Activation, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig, Linear, RmsNorm, VarBuilder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1779,7 +1781,11 @@ impl AutoencoderKLLtxVideo {
             return self.tiled_encode(x, train);
         }
 
-        let mut h = self.encoder.as_ref().expect("encoder required for encode()").forward(x, train)?;
+        let mut h = self
+            .encoder
+            .as_ref()
+            .expect("encoder required for encode()")
+            .forward(x, train)?;
         if let Some(ref qc) = self.quant_conv {
             h = qc.forward(&h)?;
         }
@@ -1922,7 +1928,11 @@ impl AutoencoderKLLtxVideo {
                 let h_end = (i + self.tile_sample_min_height).min(height);
                 let w_end = (j + self.tile_sample_min_width).min(width);
                 let tile = x.i((.., .., .., i..h_end, j..w_end))?;
-                let mut enc = self.encoder.as_ref().expect("encoder required for encode()").forward(&tile, train)?;
+                let mut enc = self
+                    .encoder
+                    .as_ref()
+                    .expect("encoder required for encode()")
+                    .forward(&tile, train)?;
                 if let Some(ref qc) = self.quant_conv {
                     enc = qc.forward(&enc)?;
                 }
@@ -2050,7 +2060,11 @@ impl AutoencoderKLLtxVideo {
             {
                 self.tiled_encode(&tile, train)?
             } else {
-                let mut h = self.encoder.as_ref().expect("encoder required for encode()").forward(&tile, train)?;
+                let mut h = self
+                    .encoder
+                    .as_ref()
+                    .expect("encoder required for encode()")
+                    .forward(&tile, train)?;
                 if let Some(ref qc) = self.quant_conv {
                     h = qc.forward(&h)?;
                 }

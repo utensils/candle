@@ -348,8 +348,7 @@ impl PaddleOCRVLModel {
 
                 if num_tokens != num_embeddings {
                     return Err(candle::Error::Msg(format!(
-                        "Image {} has {} placeholder tokens but {} embeddings",
-                        img_idx, num_tokens, num_embeddings
+                        "Image {img_idx} has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                     )));
                 }
 
@@ -466,8 +465,7 @@ impl PaddleOCRVLModel {
 
                 if num_tokens != num_embeddings {
                     return Err(candle::Error::Msg(format!(
-                        "Image {} has {} placeholder tokens but {} embeddings",
-                        img_idx, num_tokens, num_embeddings
+                        "Image {img_idx} has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                     )));
                 }
 
@@ -534,11 +532,11 @@ impl PaddleOCRVLModel {
             return Ok(generated_tokens);
         }
 
-        let mut seqlen_offset = current_ids.dim(1)?;
+        let seqlen_offset_start = current_ids.dim(1)?;
         current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
 
         // Subsequent forward passes (text only, using KV cache)
-        for _ in 1..max_new_tokens {
+        for (seqlen_offset, _) in (seqlen_offset_start..).zip(1..max_new_tokens) {
             let logits = self.forward(&current_ids, None, None, seqlen_offset)?;
             let next_token = logits
                 .argmax(D::Minus1)?
@@ -551,7 +549,6 @@ impl PaddleOCRVLModel {
                 break;
             }
 
-            seqlen_offset += 1;
             current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
         }
 
@@ -595,12 +592,12 @@ impl PaddleOCRVLModel {
             return Ok(generated_tokens);
         }
 
-        let mut seqlen_offset = current_ids.dim(1)?;
+        let seqlen_offset_start = current_ids.dim(1)?;
         current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
 
         // Subsequent forward passes (text only, using KV cache)
         // Uses same incremental decoding as single-image generation
-        for _ in 1..max_new_tokens {
+        for (seqlen_offset, _) in (seqlen_offset_start..).zip(1..max_new_tokens) {
             let logits = self.forward(&current_ids, None, None, seqlen_offset)?;
             let next_token = logits
                 .argmax(D::Minus1)?
@@ -613,7 +610,6 @@ impl PaddleOCRVLModel {
                 break;
             }
 
-            seqlen_offset += 1;
             current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
         }
 
@@ -661,11 +657,11 @@ impl PaddleOCRVLModel {
             return Ok(generated_tokens);
         }
 
-        let mut seqlen_offset = current_ids.dim(1)?;
+        let seqlen_offset_start = current_ids.dim(1)?;
         current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
 
         // Subsequent forward passes (text only, using KV cache)
-        for _ in 1..max_new_tokens {
+        for (seqlen_offset, _) in (seqlen_offset_start..).zip(1..max_new_tokens) {
             let logits = self.forward(&current_ids, None, None, seqlen_offset)?;
             let next_token = logits
                 .argmax(D::Minus1)?
@@ -678,7 +674,6 @@ impl PaddleOCRVLModel {
                 break;
             }
 
-            seqlen_offset += 1;
             current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
         }
 
@@ -758,8 +753,7 @@ impl PaddleOCRVLModel {
 
             if num_tokens != num_embeddings {
                 return Err(candle::Error::Msg(format!(
-                    "Video has {} placeholder tokens but {} embeddings",
-                    num_tokens, num_embeddings
+                    "Video has {num_tokens} placeholder tokens but {num_embeddings} embeddings"
                 )));
             }
 
@@ -867,11 +861,11 @@ impl PaddleOCRVLModel {
             return Ok(generated_tokens);
         }
 
-        let mut seqlen_offset = current_ids.dim(1)?;
+        let seqlen_offset_start = current_ids.dim(1)?;
         current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
 
         // Subsequent forward passes (text only, using KV cache)
-        for _ in 1..max_new_tokens {
+        for (seqlen_offset, _) in (seqlen_offset_start..).zip(1..max_new_tokens) {
             let logits = self.forward(&current_ids, None, None, seqlen_offset)?;
             let logits = apply_repetition_penalty(&logits, &generated_tokens, repetition_penalty)?;
             let next_token = logits
@@ -885,7 +879,6 @@ impl PaddleOCRVLModel {
                 break;
             }
 
-            seqlen_offset += 1;
             current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
         }
 
@@ -1044,10 +1037,10 @@ impl PaddleOCRVLModel {
         }
 
         // Generation steps
-        let mut seqlen_offset = input_ids.dim(1)?;
+        let seqlen_offset_start = input_ids.dim(1)?;
         let mut current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
 
-        for step in 1..max_steps {
+        for (seqlen_offset, step) in (seqlen_offset_start..).zip(1..max_steps) {
             // Compute position for M-RoPE
             let pos = seqlen_offset as i64 + self.mrope_position_delta;
             let (batch_size, seq_len, _) = {
@@ -1100,7 +1093,6 @@ impl PaddleOCRVLModel {
                 break;
             }
 
-            seqlen_offset += 1;
             current_ids = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
         }
 

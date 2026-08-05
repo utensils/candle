@@ -11,6 +11,8 @@ use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use half::{bf16, f16};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
@@ -21,8 +23,13 @@ pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
+type ParamCache = HashMap<(DeviceId, Vec<usize>), Arc<CudaSlice<usize>>>;
+
+static CUDA_PARAM_CACHE: OnceLock<Mutex<ParamCache>> = OnceLock::new();
+
 pub enum SlicePtrOrNull<T> {
     Ptr(CudaSlice<T>),
+    Cached(Arc<CudaSlice<T>>),
     Null,
 }
 
@@ -30,6 +37,7 @@ impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
             SlicePtrOrNull::Ptr(slice) => builder.arg(slice),
+            SlicePtrOrNull::Cached(slice) => builder.arg(slice.as_ref()),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -54,13 +62,38 @@ impl crate::scalar::Scalar {
 }
 
 impl SlicePtrOrNull<usize> {
+    pub fn params_from_vec(dev: &CudaDevice, params: Vec<usize>) -> Result<Self> {
+        if device::cuda_graph_htod_cache_enabled() {
+            let key = (dev.id(), params.clone());
+            let cache = CUDA_PARAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(slice) = cache.lock().unwrap().get(&key).cloned() {
+                return Ok(SlicePtrOrNull::Cached(slice));
+            }
+
+            let is_capturing = dev.cuda_stream().capture_status()
+                == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
+            if is_capturing {
+                crate::bail!(
+                    "h2d param cache miss during CUDA graph capture: \
+                     warmup did not populate all required parameter vectors"
+                );
+            }
+
+            let slice = Arc::new(dev.cuda_stream().clone_htod(&params).w()?);
+            let mut cache = cache.lock().unwrap();
+            let slice = cache.entry(key).or_insert_with(|| slice).clone();
+            return Ok(SlicePtrOrNull::Cached(slice));
+        }
+
+        Ok(SlicePtrOrNull::Ptr(dev.clone_htod(&params)?))
+    }
+
     pub fn params_from_layout(dev: &CudaDevice, l: &Layout) -> Result<Self> {
-        let ds = if l.is_contiguous() {
-            SlicePtrOrNull::Null
+        if l.is_contiguous() {
+            Ok(SlicePtrOrNull::Null)
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[l.dims(), l.stride()].concat())?)
-        };
-        Ok(ds)
+            Self::params_from_vec(dev, [l.dims(), l.stride()].concat())
+        }
     }
 }
 
@@ -188,7 +221,7 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -200,7 +233,7 @@ impl Map1 for Im2Col1D {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -239,7 +272,7 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -253,7 +286,7 @@ impl Map1 for Im2Col {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -331,7 +364,8 @@ impl Map1Any for FastReduce<'_> {
             block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let ds = dev.clone_htod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let ds =
+            SlicePtrOrNull::params_from_vec(dev, [dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let (name, check_empty, return_index) = match self.1 {
             ReduceOp::Sum => ("fast_sum", false, false),
@@ -351,7 +385,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            ds.builder_arg(&mut builder);
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -364,7 +398,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            ds.builder_arg(&mut builder);
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -430,7 +464,7 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, [ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -447,7 +481,7 @@ impl Map1 for IndexSelect<'_> {
         let mut builder = func.builder();
         barg!(builder, dst_el);
         barg!(builder, ids_dims.len());
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         barg!(builder, ids);
         builder.arg(&src);
         builder.arg(&out);
@@ -703,10 +737,10 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let mut builder = func.builder();
         barg!(builder, el, l_out, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -746,10 +780,10 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let mut builder = func.builder();
         barg!(builder, el, out_w, out_h, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -817,7 +851,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, l_out);
@@ -825,7 +859,7 @@ impl Map2 for ConvTranspose1D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -865,7 +899,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, out_w);
@@ -874,7 +908,7 @@ impl Map2 for ConvTranspose2D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -925,14 +959,14 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, self.w_k);
         barg!(builder, self.h_k);
         barg!(builder, self.w_stride);
         barg!(builder, self.h_stride);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -964,7 +998,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let mut builder = func.builder();
@@ -972,7 +1006,7 @@ impl Map1 for UpsampleNearest2D {
         barg!(builder, out_h);
         barg!(builder, scale_w);
         barg!(builder, scale_h);
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -1013,7 +1047,7 @@ impl Map1 for UpsampleBilinear2D {
 
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
 
         let mut builder = func.builder();
         barg!(builder, out_w);
@@ -1023,7 +1057,7 @@ impl Map1 for UpsampleBilinear2D {
         barg!(builder, self.scale_h_factor.unwrap_or(0.0));
         barg!(builder, self.scale_w_factor.is_some());
         barg!(builder, self.scale_w_factor.unwrap_or(0.0));
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(&out);
 
@@ -1068,8 +1102,10 @@ impl Map2 for WhereCond<'_> {
         let dims = shape.dims();
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
-        let ds =
-            dev.clone_htod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+        let ds = SlicePtrOrNull::params_from_vec(
+            dev,
+            [dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat(),
+        )?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
@@ -1078,7 +1114,7 @@ impl Map2 for WhereCond<'_> {
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, dims.len());
-        builder.arg(&ds);
+        ds.builder_arg(&mut builder);
         barg!(builder, ids);
         builder.arg(t);
         builder.arg(f);
@@ -1105,7 +1141,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::params_from_vec(dev, [dims, lhs_l.stride(), rhs_l.stride()].concat())?
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1142,7 +1178,7 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::params_from_vec(dev, [dims, lhs_l.stride(), rhs_l.stride()].concat())?
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1420,24 +1456,24 @@ fn gemm_fp8_to_bf16(
     let stream = blas_lt.stream();
     let handle = *blas_lt.handle();
 
-    let (a_rows, a_cols) = if transa { (k as u64, n as u64) } else { (n as u64, k as u64) };
-    let (b_rows, b_cols) = if transb { (m as u64, k as u64) } else { (k as u64, m as u64) };
+    let (a_rows, a_cols) = if transa {
+        (k as u64, n as u64)
+    } else {
+        (n as u64, k as u64)
+    };
+    let (b_rows, b_cols) = if transb {
+        (m as u64, k as u64)
+    } else {
+        (k as u64, m as u64)
+    };
 
     // Create matrix layouts: A and B are FP8, C is BF16
-    let a_layout = lt::create_matrix_layout(
-        lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
-        a_rows,
-        a_cols,
-        lda,
-    )
-    .w()?;
-    let b_layout = lt::create_matrix_layout(
-        lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
-        b_rows,
-        b_cols,
-        ldb,
-    )
-    .w()?;
+    let a_layout =
+        lt::create_matrix_layout(lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, a_rows, a_cols, lda)
+            .w()?;
+    let b_layout =
+        lt::create_matrix_layout(lt_sys::cudaDataType_t::CUDA_R_8F_E4M3, b_rows, b_cols, ldb)
+            .w()?;
     let c_layout = lt::create_matrix_layout(
         lt_sys::cudaDataType_t::CUDA_R_16BF,
         n as u64,
@@ -1957,6 +1993,16 @@ impl BackendStorage for CudaStorage {
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
+        if device::cuda_graph_htod_cache_enabled() {
+            let is_capturing = self.device.cuda_stream().capture_status()
+                == Ok(cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE);
+            if is_capturing {
+                crate::bail!(
+                    "to_cpu_storage during CUDA graph capture: host/device copies are not \
+                     permitted while capturing"
+                );
+            }
+        }
         match &self.slice {
             CudaStorageSlice::U8(slice) => {
                 let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
@@ -2507,9 +2553,8 @@ impl BackendStorage for CudaStorage {
                 let lhs_fp8 = &lhs_fp8.slice(lhs_l.start_offset()..);
                 let rhs_fp8 = &rhs_fp8.slice(rhs_l.start_offset()..);
                 let mut out = unsafe { dev.alloc::<bf16>(elem_count)? };
-                match gemm_fp8_to_bf16(
-                    dev, (b, m, n, k), lhs_fp8, lhs_l, rhs_fp8, rhs_l, &mut out,
-                ) {
+                match gemm_fp8_to_bf16(dev, (b, m, n, k), lhs_fp8, lhs_l, rhs_fp8, rhs_l, &mut out)
+                {
                     Ok(()) => CudaStorageSlice::BF16(out),
                     Err(_) => {
                         // FP8 TN layout not available — cast to BF16 and use regular matmul.

@@ -589,8 +589,7 @@ pub fn compute_mrope_position_ids_video(
             let actual_tokens = end - start;
             if actual_tokens != num_vision_tokens {
                 return Err(candle::Error::Msg(format!(
-                    "Video has {} tokens but grid {}x{}x{} = {} expected",
-                    actual_tokens, grid_t, grid_h, grid_w, num_vision_tokens
+                    "Video has {actual_tokens} tokens but grid {grid_t}x{grid_h}x{grid_w} = {num_vision_tokens} expected"
                 )));
             }
         }
@@ -924,7 +923,7 @@ impl Attention {
 
         // Merge RoPE tensors with prefix
         for (k, v) in rope_tensors {
-            tensors.insert(format!("rope_{}", k), v);
+            tensors.insert(format!("rope_{k}"), v);
         }
 
         tensors.insert("q_post_rope".to_string(), query_states.clone());
@@ -1063,7 +1062,7 @@ impl DecoderLayer {
 
         // Merge attention tensors with prefix
         for (k, v) in attn_tensors {
-            tensors.insert(format!("attn_{}", k), v);
+            tensors.insert(format!("attn_{k}"), v);
         }
 
         let xs = (attn_out + residual)?;
@@ -1078,7 +1077,7 @@ impl DecoderLayer {
 
         // Merge MLP tensors with prefix
         for (k, v) in mlp_tensors {
-            tensors.insert(format!("mlp_{}", k), v);
+            tensors.insert(format!("mlp_{k}"), v);
         }
 
         tensors.insert("mlp_output".to_string(), mlp_out.clone());
@@ -1238,13 +1237,13 @@ impl TextModel {
                 xs = layer_out;
                 // Add layer 1 tensors with prefix
                 for (k, v) in layer_tensors {
-                    tensors.insert(format!("layer1_{}", k), v);
+                    tensors.insert(format!("layer1_{k}"), v);
                 }
             } else {
                 xs = layer.forward_with_mrope(&xs, attention_mask.as_ref(), position_ids)?;
             }
             // Capture EVERY layer output for detailed comparison
-            tensors.insert(format!("layer_{}_output", i), xs.clone());
+            tensors.insert(format!("layer_{i}_output"), xs.clone());
         }
 
         // Final layer norm

@@ -1,6 +1,6 @@
 use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
-use crate::{DType, MetalDevice, MetalStorage, Result, Shape, D};
+use crate::{DType, Layout, MetalDevice, MetalStorage, Result, Shape, D};
 use candle_metal_kernels::metal::Buffer;
 use std::sync::Arc;
 
@@ -13,7 +13,11 @@ pub struct QMetalStorage {
 impl QMetalStorage {
     pub fn zeros(device: &MetalDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
-        let buffer = device.allocate_zeros(size)?;
+        let buffer = device
+            .new_buffer_builder()
+            .with_zeros(size)
+            .with_label("qstorage_zeros")
+            .build()?;
         Ok(Self {
             buffer,
             device: device.clone(),
@@ -42,10 +46,7 @@ impl QMetalStorage {
 
         // Check if this dtype is supported by GPU dequantize kernels
         let kernel_dtype: candle_metal_kernels::GgmlDType = self.dtype.into();
-        let gpu_supported = !matches!(
-            self.dtype,
-            GgmlDType::Q8_1 | GgmlDType::Q8K
-        );
+        let gpu_supported = !matches!(self.dtype, GgmlDType::Q8_1 | GgmlDType::Q8K);
 
         if !gpu_supported {
             // Fall back to CPU dequantize for unsupported types
@@ -90,73 +91,89 @@ impl QMetalStorage {
     fn dequantize_cpu(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 
-        self.device.wait_until_completed()?;
-        let mut out = vec![0.0f32; elem_count];
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size(self.buffer.length())
+            .with_label("qstorage_dequantize_blit")
+            .build()?;
+        {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("blit_to_cpu");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+        }
+        self.device.flush_and_wait_current()?;
+        let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
         match self.dtype {
             GgmlDType::F32 => {
-                let vec: Vec<f32> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<f32> = read_to_vec(&buffer, block_len);
                 f32::to_float(&vec, &mut out);
             }
             GgmlDType::F16 => {
-                let vec: Vec<half::f16> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<half::f16> = read_to_vec(&buffer, block_len);
                 half::f16::to_float(&vec, &mut out);
             }
             GgmlDType::BF16 => {
-                let vec: Vec<half::bf16> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<half::bf16> = read_to_vec(&buffer, block_len);
                 half::bf16::to_float(&vec, &mut out);
             }
             GgmlDType::Q4_0 => {
-                let vec: Vec<crate::quantized::BlockQ4_0> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ4_0> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ4_0::to_float(&vec, &mut out);
             }
             GgmlDType::Q4_1 => {
-                let vec: Vec<crate::quantized::BlockQ4_1> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ4_1> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ4_1::to_float(&vec, &mut out);
             }
             GgmlDType::Q5_0 => {
-                let vec: Vec<crate::quantized::BlockQ5_0> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ5_0> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ5_0::to_float(&vec, &mut out);
             }
             GgmlDType::Q5_1 => {
-                let vec: Vec<crate::quantized::BlockQ5_1> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ5_1> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ5_1::to_float(&vec, &mut out);
             }
             GgmlDType::Q8_0 => {
-                let vec: Vec<crate::quantized::BlockQ8_0> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ8_0> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8_0::to_float(&vec, &mut out);
             }
             GgmlDType::Q8_1 => {
-                let vec: Vec<crate::quantized::BlockQ8_1> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ8_1> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8_1::to_float(&vec, &mut out);
             }
             GgmlDType::Q2K => {
-                let vec: Vec<crate::quantized::BlockQ2K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ2K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ2K::to_float(&vec, &mut out);
             }
             GgmlDType::Q3K => {
-                let vec: Vec<crate::quantized::BlockQ3K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ3K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ3K::to_float(&vec, &mut out);
             }
             GgmlDType::Q4K => {
-                let vec: Vec<crate::quantized::BlockQ4K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ4K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ4K::to_float(&vec, &mut out);
             }
             GgmlDType::Q5K => {
-                let vec: Vec<crate::quantized::BlockQ5K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ5K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ5K::to_float(&vec, &mut out);
             }
             GgmlDType::Q6K => {
-                let vec: Vec<crate::quantized::BlockQ6K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ6K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ6K::to_float(&vec, &mut out);
             }
             GgmlDType::Q8K => {
-                let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&self.buffer, block_len);
+                let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
         }
 
-        let buffer = self.device.new_buffer_with_data(&out)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&out)
+            .with_label("qstorage_dequantized")
+            .build()?;
         Ok(MetalStorage::new(
             buffer,
             self.device.clone(),
@@ -177,7 +194,12 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize(&src)?;
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantized")
+            .build()?;
         self.buffer = buffer;
         Ok(())
     }
@@ -194,7 +216,12 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize_imatrix(&src, imatrix_weights, n_per_row)?;
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_imatrix")
+            .build()?;
         self.buffer = buffer;
         Ok(())
     }
@@ -215,7 +242,12 @@ impl QMetalStorage {
             unreachable!()
         }
 
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_imatrix_onto")
+            .build()?;
         self.buffer = buffer;
         Ok(())
     }
@@ -231,7 +263,12 @@ impl QMetalStorage {
             unreachable!()
         }
 
-        let buffer = self.device.new_buffer_with_data(&qcpu_storage.data()?)?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_data(&qcpu_storage.data()?)
+            .with_label("qstorage_quantize_onto")
+            .build()?;
         self.buffer = buffer;
         Ok(())
     }
@@ -246,6 +283,64 @@ impl QMetalStorage {
     /// diffusion models (precision errors compound across denoising iterations).
     /// Instead, we dequantize the weight to F32, use standard Metal GEMM, and
     /// free the temporary F32 copy. Peak extra memory: one layer (~50-200MB).
+    pub fn embedding(
+        &self,
+        rows: usize,
+        hidden: usize,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+    ) -> Result<MetalStorage> {
+        use crate::MetalError;
+
+        if ids.dtype() != DType::U32 {
+            crate::bail!("quantized embedding expects u32 ids, got {:?}", ids.dtype())
+        }
+        if !ids_l.is_contiguous() {
+            crate::bail!("quantized embedding requires contiguous ids")
+        }
+        if !hidden.is_multiple_of(self.dtype.block_size()) {
+            crate::bail!(
+                "quantized embedding hidden size {hidden} is not divisible by block size {}",
+                self.dtype.block_size()
+            )
+        }
+        let expected_size = rows * hidden * self.dtype.type_size() / self.dtype.block_size();
+        if self.storage_size_in_bytes() != expected_size {
+            crate::bail!(
+                "quantized tensor has {} bytes, expected {expected_size}",
+                self.storage_size_in_bytes()
+            )
+        }
+        let ids_len = ids_l.shape().elem_count();
+        let device = self.device.clone();
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(ids_len * hidden, DType::F32)
+            .with_label("qembedding")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        candle_metal_kernels::call_quantized_get_rows(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            self.dtype.into(),
+            hidden,
+            hidden * self.dtype.type_size() / self.dtype.block_size(),
+            ids_len,
+            &self.buffer,
+            ids.buffer(),
+            ids_l.start_offset() * DType::U32.size_in_bytes(),
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        Ok(MetalStorage::new(
+            dst,
+            device.clone(),
+            ids_len * hidden,
+            DType::F32,
+        ))
+    }
+
     pub fn fwd(
         &self,
         self_shape: &Shape,
@@ -269,7 +364,6 @@ impl QMetalStorage {
         if last_k != k {
             crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
         }
-
         // Dequantize weight [n, k] to F32 on GPU (no CPU roundtrip)
         let deq_weight = self.dequantize_on_gpu(n, k)?;
         let rhs_l = crate::Layout::contiguous_with_offset(self_shape, 0);
@@ -306,14 +400,18 @@ impl QMetalStorage {
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
-        let buffer = self.device.allocate_buffer(self.buffer.length())?;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size(self.buffer.length())
+            .with_label("qstorage_data_blit")
+            .build()?;
         {
-            let blit = self.device.blit_command_encoder()?;
+            let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
             blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
-            blit.end_encoding();
         }
-        self.device.wait_until_completed()?;
+        self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
     }
 }
@@ -322,7 +420,11 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device.new_buffer_with_data(data)?;
+    let buffer = device
+        .new_buffer_builder()
+        .with_data(data)
+        .with_label("qstorage_load_quantized")
+        .build()?;
     let device = device.clone();
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,

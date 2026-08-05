@@ -35,8 +35,7 @@ fn bilinear_pytorch_2x_upscale(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-4,
-        "Max difference {} exceeds threshold 1e-4",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-4"
     );
     Ok(())
 }
@@ -66,8 +65,7 @@ fn bilinear_pytorch_downscale(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-4,
-        "Max difference {} exceeds threshold 1e-4",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-4"
     );
     Ok(())
 }
@@ -117,11 +115,7 @@ fn bilinear_pytorch_multi_channel(dev: &Device) -> Result<()> {
         let diff = (out - exp).abs();
         assert!(
             diff < 1e-3,
-            "Channel 0, row 0, index {} differs: got {}, expected {}, diff {}",
-            i,
-            out,
-            exp,
-            diff
+            "Channel 0, row 0, index {i} differs: got {out}, expected {exp}, diff {diff}"
         );
     }
 
@@ -139,11 +133,7 @@ fn bilinear_pytorch_multi_channel(dev: &Device) -> Result<()> {
         let diff = (out - exp).abs();
         assert!(
             diff < 1e-3,
-            "Channel 1, row 0, index {} differs: got {}, expected {}, diff {}",
-            i,
-            out,
-            exp,
-            diff
+            "Channel 1, row 0, index {i} differs: got {out}, expected {exp}, diff {diff}"
         );
     }
 
@@ -175,8 +165,7 @@ fn bilinear_pytorch_align_corners_true(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-3,
-        "Max difference {} exceeds threshold 1e-3",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-3"
     );
 
     // Verify corners are exactly preserved with align_corners=True
@@ -221,8 +210,7 @@ fn bilinear_pytorch_scale_factor(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-6,
-        "scale_factor and size methods differ by {}",
-        max_diff
+        "scale_factor and size methods differ by {max_diff}"
     );
 
     Ok(())
@@ -260,8 +248,7 @@ fn bilinear_pytorch_non_square_exact(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-4,
-        "Max difference {} exceeds threshold 1e-4",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-4"
     );
     Ok(())
 }
@@ -285,8 +272,7 @@ fn bilinear_pytorch_tiny_1x1_to_3x3(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-6,
-        "Max difference {} exceeds threshold 1e-6",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-6"
     );
     Ok(())
 }
@@ -318,8 +304,7 @@ fn bilinear_pytorch_tiny_1x2_to_3x6(dev: &Device) -> Result<()> {
 
     assert!(
         max_diff < 1e-6,
-        "Max difference {} exceeds threshold 1e-6",
-        max_diff
+        "Max difference {max_diff} exceeds threshold 1e-6"
     );
     Ok(())
 }
@@ -357,9 +342,7 @@ fn bilinear_pytorch_large_64x64_to_128x128(dev: &Device) -> Result<()> {
 
     assert!(
         min_val > -10.0 && max_val < 10.0,
-        "Large tensor output values out of expected range: min={}, max={}",
-        min_val,
-        max_val
+        "Large tensor output values out of expected range: min={min_val}, max={max_val}"
     );
 
     Ok(())
