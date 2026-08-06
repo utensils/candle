@@ -15,7 +15,13 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 // overflow the stack with a chain of arrays-of-arrays.
 const GGUF_MAX_STRING_LENGTH: u64 = 1 << 30;
 const GGUF_MAX_ARRAY_ELEMENTS: u64 = 1 << 30;
-const GGUF_MAX_TENSOR_DIMS: u32 = 4;
+// llama.cpp's GGML_MAX_DIMS is 4, but the image/video-model GGUF ecosystem
+// (city96 ComfyUI-GGUF converters and downstream publishers such as
+// QuantStack) legitimately emits 5-D tensors: video DiT patch embeddings are
+// Conv3d weights of shape [dim, in, kt, kh, kw] and every published Wan
+// GGUF carries exactly one, stored unquantized. n_dims is a u32 in the GGUF
+// format itself; the cap is a sanity bound, not a format rule.
+const GGUF_MAX_TENSOR_DIMS: u32 = 5;
 const GGUF_MAX_VALUE_DEPTH: usize = 64;
 
 // `file_size` is the byte length captured once up front, so this avoids
