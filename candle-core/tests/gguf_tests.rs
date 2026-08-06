@@ -134,3 +134,39 @@ fn rejects_string_length_above_remaining_file_bytes() {
     pad(&mut buf, 64);
     assert_rejects(buf, "string length");
 }
+
+#[test]
+fn five_dimensional_tensor_round_trips() {
+    // Video DiT patch embeddings are Conv3d weights [dim, in, kt, kh, kw];
+    // every published Wan GGUF (city96 converter lineage) carries one such
+    // 5-D tensor stored unquantized. llama.cpp caps at GGML_MAX_DIMS = 4,
+    // but n_dims is a u32 in the format and these files are legitimate.
+    use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+    use candle_core::Tensor;
+
+    let tensor = Tensor::arange(0f32, 240f32, &Device::Cpu)
+        .unwrap()
+        .reshape((10, 6, 1, 2, 2))
+        .unwrap();
+    let qtensor = QTensor::quantize(&tensor, GgmlDType::F32).unwrap();
+    let mut buf = Cursor::new(Vec::new());
+    gguf_file::write(&mut buf, &[], &[("patch_embedding.weight", &qtensor)]).unwrap();
+
+    buf.set_position(0);
+    let content = Content::read(&mut buf).expect("5-D tensor infos must parse");
+    let info = &content.tensor_infos["patch_embedding.weight"];
+    assert_eq!(info.shape.dims(), &[10, 6, 1, 2, 2]);
+    let loaded = content
+        .tensor(&mut buf, "patch_embedding.weight", &Device::Cpu)
+        .expect("5-D tensor data must load");
+    let round_tripped = loaded.dequantize(&Device::Cpu).unwrap();
+    let diff = (&round_tripped - &tensor)
+        .unwrap()
+        .abs()
+        .unwrap()
+        .max_all()
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+    assert_eq!(diff, 0.0, "F32 round trip must be exact");
+}
