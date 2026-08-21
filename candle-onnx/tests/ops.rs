@@ -7226,3 +7226,119 @@ fn test_one_hot() -> Result<()> {
 
     Ok(())
 }
+
+fn resize_graph(scales_input: &str) -> ModelProto {
+    let attr = |name: &str, value: &str| AttributeProto {
+        name: name.to_string(),
+        ref_attr_name: String::new(),
+        i: 0,
+        doc_string: String::new(),
+        r#type: AttributeType::String.into(),
+        f: 0.0,
+        s: value.as_bytes().to_vec(),
+        t: None,
+        g: None,
+        sparse_tensor: None,
+        tp: None,
+        floats: vec![],
+        ints: vec![],
+        strings: vec![],
+        tensors: vec![],
+        graphs: vec![],
+        sparse_tensors: vec![],
+        type_protos: vec![],
+    };
+    create_model_proto_with_graph(Some(GraphProto {
+        node: vec![NodeProto {
+            op_type: "Resize".to_string(),
+            domain: "".to_string(),
+            attribute: vec![
+                attr("mode", "nearest"),
+                attr("nearest_mode", "floor"),
+                attr("coordinate_transformation_mode", "asymmetric"),
+            ],
+            input: vec![
+                INPUT_X.to_string(),
+                String::new(),
+                scales_input.to_string(),
+                INPUT_A.to_string(),
+            ],
+            output: vec![OUTPUT_Z.to_string()],
+            name: "".to_string(),
+            doc_string: "".to_string(),
+        }],
+        name: "".to_string(),
+        initializer: vec![],
+        input: vec![],
+        output: vec![ValueInfoProto {
+            name: OUTPUT_Z.to_string(),
+            doc_string: "".to_string(),
+            r#type: None,
+        }],
+        value_info: vec![],
+        doc_string: "".to_string(),
+        sparse_initializer: vec![],
+        quantization_annotation: vec![],
+    }))
+}
+
+// "Resize": an exporter may pass a zero-element tensor for the optional
+// `scales` input while supplying `sizes`; that tensor means "absent".
+#[test]
+fn test_resize_treats_empty_scales_as_absent() -> Result<()> {
+    let manual_graph = resize_graph(INPUT_Y);
+    let mut inputs: HashMap<String, Tensor> = HashMap::new();
+    inputs.insert(
+        INPUT_X.to_string(),
+        Tensor::new(&[[[[1.0f32, 2.0], [3.0, 4.0]]]], &Device::Cpu)?,
+    );
+    inputs.insert(
+        INPUT_Y.to_string(),
+        Tensor::zeros(0, DType::F32, &Device::Cpu)?,
+    );
+    inputs.insert(
+        INPUT_A.to_string(),
+        Tensor::new(&[1i64, 1, 4, 4], &Device::Cpu)?,
+    );
+
+    let eval = candle_onnx::simple_eval(&manual_graph, inputs)?;
+    let z = eval.get(OUTPUT_Z).expect("Output 'z' not found");
+    assert_eq!(z.dims(), &[1, 1, 4, 4]);
+    assert_eq!(
+        to_vec2_round(&z.squeeze(0)?.squeeze(0)?, 4)?,
+        vec![
+            vec![1.0, 1.0, 2.0, 2.0],
+            vec![1.0, 1.0, 2.0, 2.0],
+            vec![3.0, 3.0, 4.0, 4.0],
+            vec![3.0, 3.0, 4.0, 4.0],
+        ]
+    );
+    Ok(())
+}
+
+// "Resize": a populated `scales` alongside `sizes` is still a contradiction.
+#[test]
+fn test_resize_rejects_both_scales_and_sizes() -> Result<()> {
+    let manual_graph = resize_graph(INPUT_Y);
+    let mut inputs: HashMap<String, Tensor> = HashMap::new();
+    inputs.insert(
+        INPUT_X.to_string(),
+        Tensor::new(&[[[[1.0f32, 2.0], [3.0, 4.0]]]], &Device::Cpu)?,
+    );
+    inputs.insert(
+        INPUT_Y.to_string(),
+        Tensor::new(&[1.0f32, 1.0, 2.0, 2.0], &Device::Cpu)?,
+    );
+    inputs.insert(
+        INPUT_A.to_string(),
+        Tensor::new(&[1i64, 1, 4, 4], &Device::Cpu)?,
+    );
+
+    let err = candle_onnx::simple_eval(&manual_graph, inputs).expect_err("both set must fail");
+    assert!(
+        err.to_string()
+            .contains("Scales and sizes cannot both be set"),
+        "{err}"
+    );
+    Ok(())
+}
