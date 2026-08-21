@@ -2287,17 +2287,22 @@ fn simple_eval_(
                     bail!("Unsupported rank for nearest resize: {}", input.rank());
                 }
 
-                let scales = if node.input.len() > 2 && !node.input[2].is_empty() {
-                    Some(get(&node.input[2])?)
-                } else {
-                    None
+                // An optional input is absent when its name is empty OR when it
+                // names a zero-element tensor: the ONNX spec lets an exporter pass
+                // an empty initializer for `roi`/`scales` while supplying `sizes`
+                // (insightface's SCRFD graphs do exactly that), so presence must
+                // be decided on the tensor, not on the name.
+                let optional_input = |index: usize| -> Result<Option<Tensor>> {
+                    match node.input.get(index) {
+                        Some(name) if !name.is_empty() => {
+                            let tensor = get(name)?;
+                            Ok((tensor.elem_count() > 0).then(|| tensor.clone()))
+                        }
+                        _ => Ok(None),
+                    }
                 };
-
-                let sizes = if node.input.len() > 3 && !node.input[3].is_empty() {
-                    Some(get(&node.input[3])?)
-                } else {
-                    None
-                };
+                let scales = optional_input(2)?;
+                let sizes = optional_input(3)?;
 
                 let output_dims = match (scales, sizes) {
                     (Some(_), Some(_)) => {
