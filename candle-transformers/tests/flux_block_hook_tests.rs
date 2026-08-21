@@ -343,13 +343,11 @@ fn malformed_replacements_are_rejected() -> Result<()> {
     for_each_model(|model, _cfg, i| {
         let err = model
             .hooked(i, &TruncatingHook)
-            .err()
-            .expect("shape change must fail");
+            .expect_err("shape change must fail");
         assert!(err.to_string().contains("single block 0"), "{err}");
         let err = model
             .hooked(i, &RetypingHook)
-            .err()
-            .expect("dtype change must fail");
+            .expect_err("dtype change must fail");
         assert!(err.to_string().contains("double block 0"), "{err}");
         Ok(())
     })
