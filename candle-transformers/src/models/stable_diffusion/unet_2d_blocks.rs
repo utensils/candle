@@ -1,7 +1,8 @@
 //! 2D UNet Building Blocks
 //!
 use super::attention::{
-    AttentionBlock, AttentionBlockConfig, SpatialTransformer, SpatialTransformerConfig,
+    AttentionBlock, AttentionBlockConfig, HookCursor, NoopCrossAttentionHook, SpatialTransformer,
+    SpatialTransformerConfig,
 };
 use super::resnet::{ResnetBlock2D, ResnetBlock2DConfig};
 use crate::models::with_tracing::{conv2d, Conv2d};
@@ -454,10 +455,30 @@ impl UNetMidBlock2DCrossAttn {
         temb: Option<&Tensor>,
         encoder_hidden_states: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_hook(
+            xs,
+            temb,
+            encoder_hidden_states,
+            &HookCursor::new(&NoopCrossAttentionHook),
+        )
+    }
+
+    /// Same as [`Self::forward`], advancing `cursor` once per `attn2` module of
+    /// this block's transformers.
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        temb: Option<&Tensor>,
+        encoder_hidden_states: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut xs = self.resnet.forward(xs, temb)?;
         for (attn, resnet) in self.attn_resnets.iter() {
-            xs = resnet.forward(&attn.forward(&xs, encoder_hidden_states)?, temb)?
+            xs = resnet.forward(
+                &attn.forward_with_hook(&xs, encoder_hidden_states, cursor)?,
+                temb,
+            )?
         }
         Ok(xs)
     }
@@ -643,12 +664,29 @@ impl CrossAttnDownBlock2D {
         temb: Option<&Tensor>,
         encoder_hidden_states: Option<&Tensor>,
     ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_with_hook(
+            xs,
+            temb,
+            encoder_hidden_states,
+            &HookCursor::new(&NoopCrossAttentionHook),
+        )
+    }
+
+    /// Same as [`Self::forward`], advancing `cursor` once per `attn2` module of
+    /// this block's transformers.
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        temb: Option<&Tensor>,
+        encoder_hidden_states: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let _enter = self.span.enter();
         let mut output_states = vec![];
         let mut xs = xs.clone();
         for (resnet, attn) in self.downblock.resnets.iter().zip(self.attentions.iter()) {
             xs = resnet.forward(&xs, temb)?;
-            xs = attn.forward(&xs, encoder_hidden_states)?;
+            xs = attn.forward_with_hook(&xs, encoder_hidden_states, cursor)?;
             output_states.push(xs.clone());
         }
         let xs = match &self.downblock.downsampler {
@@ -852,13 +890,35 @@ impl CrossAttnUpBlock2D {
         upsample_size: Option<(usize, usize)>,
         encoder_hidden_states: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_hook(
+            xs,
+            res_xs,
+            temb,
+            upsample_size,
+            encoder_hidden_states,
+            &HookCursor::new(&NoopCrossAttentionHook),
+        )
+    }
+
+    /// Same as [`Self::forward`], advancing `cursor` once per `attn2` module of
+    /// this block's transformers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        res_xs: &[Tensor],
+        temb: Option<&Tensor>,
+        upsample_size: Option<(usize, usize)>,
+        encoder_hidden_states: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let mut xs = xs.clone();
         for (index, resnet) in self.upblock.resnets.iter().enumerate() {
             xs = Tensor::cat(&[&xs, &res_xs[res_xs.len() - index - 1]], 1)?;
             xs = xs.contiguous()?;
             xs = resnet.forward(&xs, temb)?;
-            xs = self.attentions[index].forward(&xs, encoder_hidden_states)?;
+            xs = self.attentions[index].forward_with_hook(&xs, encoder_hidden_states, cursor)?;
         }
         match &self.upblock.upsampler {
             Some(upsampler) => upsampler.forward(&xs, upsample_size),

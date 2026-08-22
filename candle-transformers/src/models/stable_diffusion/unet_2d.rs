@@ -2,6 +2,7 @@
 //!
 //! The 2D Unet models take as input a noisy sample and the current diffusion
 //! timestep and return a denoised version of the input.
+use super::attention::{CrossAttentionHook, HookCursor, NoopCrossAttentionHook};
 use super::embeddings::{TimestepEmbedding, Timesteps};
 use super::unet_2d_blocks::*;
 use crate::models::with_tracing::{conv2d, Conv2d};
@@ -306,6 +307,30 @@ impl UNet2DConditionModel {
         self.forward_with_additional_residuals(xs, timestep, encoder_hidden_states, None, None)
     }
 
+    /// Same as [`Self::forward`], handing every cross-attention (`attn2`)
+    /// module's output to `hook` before its `to_out` projection.
+    ///
+    /// `hook` is called once per attn2 module with a running index in UNet
+    /// traversal order: down_blocks, then the mid block, then up_blocks. See
+    /// [`CrossAttentionHook`].
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        encoder_hidden_states: &Tensor,
+        hook: &dyn CrossAttentionHook,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        self.forward_with_additional_residuals_and_hook(
+            xs,
+            timestep,
+            encoder_hidden_states,
+            None,
+            None,
+            hook,
+        )
+    }
+
     pub fn forward_with_additional_residuals(
         &self,
         xs: &Tensor,
@@ -314,6 +339,31 @@ impl UNet2DConditionModel {
         down_block_additional_residuals: Option<&[Tensor]>,
         mid_block_additional_residual: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_with_additional_residuals_and_hook(
+            xs,
+            timestep,
+            encoder_hidden_states,
+            down_block_additional_residuals,
+            mid_block_additional_residual,
+            &NoopCrossAttentionHook,
+        )
+    }
+
+    /// Same as [`Self::forward_with_additional_residuals`], with the
+    /// cross-attention hook of [`Self::forward_with_hook`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_additional_residuals_and_hook(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        encoder_hidden_states: &Tensor,
+        down_block_additional_residuals: Option<&[Tensor]>,
+        mid_block_additional_residual: Option<&Tensor>,
+        hook: &dyn CrossAttentionHook,
+    ) -> Result<Tensor> {
+        // One cursor per forward pass: the counter it carries is what makes a
+        // hook's index the module's position in traversal order.
+        let cursor = HookCursor::new(hook);
         let (bsize, _channels, height, width) = xs.dims4()?;
         let device = xs.device();
         let n_blocks = self.config.blocks.len();
@@ -340,7 +390,7 @@ impl UNet2DConditionModel {
             let (_xs, res_xs) = match down_block {
                 UNetDownBlock::Basic(b) => b.forward(&xs, Some(&emb))?,
                 UNetDownBlock::CrossAttn(b) => {
-                    b.forward(&xs, Some(&emb), Some(encoder_hidden_states))?
+                    b.forward_with_hook(&xs, Some(&emb), Some(encoder_hidden_states), &cursor)?
                 }
             };
             down_block_res_xs.extend(res_xs);
@@ -362,9 +412,12 @@ impl UNet2DConditionModel {
         let mut down_block_res_xs = new_down_block_res_xs;
 
         // 4. mid
-        let xs = self
-            .mid_block
-            .forward(&xs, Some(&emb), Some(encoder_hidden_states))?;
+        let xs = self.mid_block.forward_with_hook(
+            &xs,
+            Some(&emb),
+            Some(encoder_hidden_states),
+            &cursor,
+        )?;
         let xs = match mid_block_additional_residual {
             None => xs,
             Some(m) => (m + xs)?,
@@ -384,12 +437,13 @@ impl UNet2DConditionModel {
             }
             xs = match up_block {
                 UNetUpBlock::Basic(b) => b.forward(&xs, &res_xs, Some(&emb), upsample_size)?,
-                UNetUpBlock::CrossAttn(b) => b.forward(
+                UNetUpBlock::CrossAttn(b) => b.forward_with_hook(
                     &xs,
                     &res_xs,
                     Some(&emb),
                     upsample_size,
                     Some(encoder_hidden_states),
+                    &cursor,
                 )?,
             };
         }
