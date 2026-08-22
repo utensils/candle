@@ -2,6 +2,7 @@
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn as nn;
 use candle_nn::Module;
+use std::cell::Cell;
 
 // Keep the temporary FP32 attention-score tensor at or below 1 GiB. At
 // 1024x1024, SD1.5 classifier-free guidance otherwise produces exactly 2^32
@@ -128,6 +129,94 @@ fn flash_attn(
 #[cfg(not(feature = "flash-attn"))]
 fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
     unimplemented!("compile with '--features flash-attn'")
+}
+
+/// Observes and optionally rewrites the text cross-attention output of every
+/// transformer block in the UNet.
+///
+/// IP-Adapter style conditioning (PuLID for SDXL among them) mixes an extra
+/// key/value stream into the text cross-attention. Implementing this trait lets
+/// a caller do that without owning the UNet's private attention modules.
+pub trait CrossAttentionHook {
+    /// Called once per cross-attention (`attn2`) module, in UNet traversal
+    /// order (down_blocks -> mid_block -> up_blocks, each transformer block's
+    /// attn2 in sequence), so `index` runs 0..N over the attn2 modules only
+    /// (N = 70 for SDXL, 16 for SD1.5). Self-attention (`attn1`) is never
+    /// hooked.
+    ///
+    /// `query` is `to_q`'s output `[batch, seq, inner_dim]` (before the head
+    /// split); `attended` is the text cross-attention output
+    /// `[batch, seq, inner_dim]` before `to_out`. Return `Some(replacement)` to
+    /// replace `attended`; a replacement must keep its shape and dtype.
+    fn cross_attention(
+        &self,
+        index: usize,
+        query: &Tensor,
+        attended: &Tensor,
+        heads: usize,
+    ) -> Result<Option<Tensor>> {
+        let _ = (index, query, attended, heads);
+        Ok(None)
+    }
+}
+
+/// The hook used by the plain `forward` methods: observes nothing, replaces
+/// nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopCrossAttentionHook;
+
+impl CrossAttentionHook for NoopCrossAttentionHook {}
+
+/// Walks a [`CrossAttentionHook`] across the cross-attention modules of one
+/// forward pass.
+///
+/// The counter is owned by the traversal rather than by any individual block,
+/// so the index a hook observes is the module's position in UNet traversal
+/// order by construction. A cursor is single-use: build one per forward pass.
+pub struct HookCursor<'a> {
+    hook: &'a dyn CrossAttentionHook,
+    next: Cell<usize>,
+}
+
+impl std::fmt::Debug for HookCursor<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookCursor")
+            .field("visited", &self.next.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> HookCursor<'a> {
+    pub fn new(hook: &'a dyn CrossAttentionHook) -> Self {
+        Self {
+            hook,
+            next: Cell::new(0),
+        }
+    }
+
+    /// How many cross-attention modules this cursor has visited so far.
+    pub fn visited(&self) -> usize {
+        self.next.get()
+    }
+
+    /// Reports one module's attention output and applies any replacement.
+    fn apply(&self, query: &Tensor, attended: Tensor, heads: usize) -> Result<Tensor> {
+        let index = self.next.get();
+        self.next.set(index + 1);
+        let Some(replacement) = self.hook.cross_attention(index, query, &attended, heads)? else {
+            return Ok(attended);
+        };
+        if replacement.shape() != attended.shape() || replacement.dtype() != attended.dtype() {
+            candle::bail!(
+                "cross-attention hook at index {index} returned {:?} {:?}, expected {:?} {:?}",
+                replacement.shape(),
+                replacement.dtype(),
+                attended.shape(),
+                attended.dtype()
+            )
+        }
+        Ok(replacement)
+    }
 }
 
 #[derive(Debug)]
@@ -266,19 +355,46 @@ impl CrossAttention {
     }
 
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_inner(xs, context, None)
+    }
+
+    /// Same as [`Self::forward`], reporting this module's attention output to
+    /// `cursor` before `to_out` and advancing the cursor by one.
+    ///
+    /// Only a transformer block's text cross-attention (`attn2`) is hooked;
+    /// self-attention keeps calling [`Self::forward`].
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<Tensor> {
+        self.forward_inner(xs, context, Some(cursor))
+    }
+
+    fn forward_inner(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        cursor: Option<&HookCursor>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let query = self.to_q.forward(xs)?;
         let context = context.unwrap_or(xs).contiguous()?;
         let key = self.to_k.forward(&context)?;
         let value = self.to_v.forward(&context)?;
-        let query = self.reshape_heads_to_batch_dim(&query)?;
+        let query_heads = self.reshape_heads_to_batch_dim(&query)?;
         let key = self.reshape_heads_to_batch_dim(&key)?;
         let value = self.reshape_heads_to_batch_dim(&value)?;
-        let dim0 = query.dim(0)?;
+        let dim0 = query_heads.dim(0)?;
         let slice_size = self.slice_size.filter(|&slice_size| dim0 >= slice_size);
         let xs = match slice_size {
-            None => self.attention(&query, &key, &value)?,
-            Some(slice_size) => self.sliced_attention(&query, &key, &value, slice_size)?,
+            None => self.attention(&query_heads, &key, &value)?,
+            Some(slice_size) => self.sliced_attention(&query_heads, &key, &value, slice_size)?,
+        };
+        let xs = match cursor {
+            None => xs,
+            Some(cursor) => cursor.apply(&query, xs, self.heads)?,
         };
         self.to_out.forward(&xs)
     }
@@ -397,10 +513,18 @@ impl BasicTransformerBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
+    fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let xs = (self.attn1.forward(&self.norm1.forward(xs)?, None)? + xs)?;
-        let xs = (self.attn2.forward(&self.norm2.forward(&xs)?, context)? + xs)?;
+        let xs = (self
+            .attn2
+            .forward_with_hook(&self.norm2.forward(&xs)?, context, cursor)?
+            + xs)?;
         self.ff.forward(&self.norm3.forward(&xs)?)? + xs
     }
 }
@@ -502,6 +626,17 @@ impl SpatialTransformer {
     }
 
     pub fn forward(&self, xs: &Tensor, context: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_hook(xs, context, &HookCursor::new(&NoopCrossAttentionHook))
+    }
+
+    /// Same as [`Self::forward`], advancing `cursor` once per transformer
+    /// block, i.e. once per `attn2` module.
+    pub fn forward_with_hook(
+        &self,
+        xs: &Tensor,
+        context: Option<&Tensor>,
+        cursor: &HookCursor,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (batch, _channel, height, weight) = xs.dims4()?;
         let residual = xs;
@@ -527,7 +662,7 @@ impl SpatialTransformer {
         };
         let mut xs = xs;
         for block in self.transformer_blocks.iter() {
-            xs = block.forward(&xs, context)?
+            xs = block.forward_with_hook(&xs, context, cursor)?
         }
         let xs = match &self.proj_out {
             Proj::Conv2d(p) => p.forward(

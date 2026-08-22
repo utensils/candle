@@ -51,6 +51,8 @@ pub mod uni_pc;
 pub mod utils;
 pub mod vae;
 
+pub use attention::{CrossAttentionHook, HookCursor, NoopCrossAttentionHook};
+
 use std::sync::Arc;
 
 use candle::{DType, Device, Result};
