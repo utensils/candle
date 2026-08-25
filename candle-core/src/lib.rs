@@ -53,6 +53,7 @@ pub mod backend;
 pub mod backprop;
 pub mod conv;
 mod convert;
+pub mod convrot;
 pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
