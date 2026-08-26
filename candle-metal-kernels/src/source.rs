@@ -8,6 +8,7 @@ pub const INDEXING: &str = include_str!("metal_src/indexing.metal");
 pub const GEMV: &str = include_str!("metal_src/gemv.metal");
 pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
+pub const NEIGHBORHOOD_ATTENTION: &str = include_str!("metal_src/neighborhood_attention.metal");
 pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
 pub const RANDOM: &str = include_str!("metal_src/random.metal");
 pub const REDUCE: &str = include_str!("metal_src/reduce.metal");
@@ -28,6 +29,7 @@ pub enum Source {
     Gemv,
     Indexing,
     MlxSort,
+    NeighborhoodAttention,
     Quantized,
     Random,
     Reduce,

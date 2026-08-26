@@ -7,6 +7,7 @@ pub mod fill;
 pub mod indexing;
 mod macros;
 pub mod mlx_gemm;
+pub mod neighborhood_attention;
 pub mod quantized;
 pub mod random;
 pub mod reduce;
@@ -23,6 +24,7 @@ pub use convrot::call_dequantize_int8_convrot_256;
 pub use fill::*;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
+pub use neighborhood_attention::call_neighborhood_attention3d;
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
 };

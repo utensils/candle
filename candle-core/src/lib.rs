@@ -73,6 +73,7 @@ pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod nditer;
+pub mod neighborhood_attention;
 pub mod npy;
 pub mod op;
 pub mod pickle;
