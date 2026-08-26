@@ -37,6 +37,69 @@ pub trait WithForward {
     ) -> Result<Tensor>;
 }
 
+/// Observes and optionally rewrites the residual stream after each transformer block.
+///
+/// Conditioning adapters such as PuLID add identity features at fixed block
+/// indices. Implementing this trait lets a caller do that without owning the
+/// block lists; every method defaults to "observe only" so a hook can override
+/// just the stage it cares about.
+pub trait BlockHook {
+    /// Runs after double-stream block `index` with that block's output.
+    ///
+    /// Return `Some(img)` to replace the image stream carried into the next
+    /// block. A replacement must keep `img`'s shape and dtype.
+    fn after_double_block(
+        &self,
+        index: usize,
+        img: &Tensor,
+        txt: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let _ = (index, img, txt);
+        Ok(None)
+    }
+
+    /// Runs after single-stream block `index`.
+    ///
+    /// `xs` is the `[txt, img]` concatenation along the sequence axis and the
+    /// first `txt_len` tokens are the text stream. Return `Some(xs)` to replace
+    /// the whole stream; a replacement must keep `xs`'s shape and dtype and
+    /// should leave the text prefix untouched.
+    fn after_single_block(
+        &self,
+        index: usize,
+        txt_len: usize,
+        xs: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let _ = (index, txt_len, xs);
+        Ok(None)
+    }
+}
+
+/// The hook used by [`WithForward::forward`]: observes nothing, replaces nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopBlockHook;
+
+impl BlockHook for NoopBlockHook {}
+
+/// Validates a hook's replacement against the tensor it replaces.
+fn accept_replacement(
+    stage: &str,
+    index: usize,
+    current: &Tensor,
+    replacement: Tensor,
+) -> Result<Tensor> {
+    if replacement.shape() != current.shape() || replacement.dtype() != current.dtype() {
+        candle::bail!(
+            "block hook after {stage} block {index} returned {:?} {:?}, expected {:?} {:?}",
+            replacement.shape(),
+            replacement.dtype(),
+            current.shape(),
+            current.dtype()
+        )
+    }
+    Ok(replacement)
+}
+
 pub mod autoencoder;
 pub mod model;
 pub mod quantized_model;

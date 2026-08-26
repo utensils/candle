@@ -577,9 +577,11 @@ impl Flux {
     }
 }
 
-impl super::WithForward for Flux {
+impl Flux {
+    /// Runs the transformer, handing every block's output to `hook` before the
+    /// next block consumes it. See [`super::BlockHook`].
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub fn forward_with_hook(
         &self,
         img: &Tensor,
         img_ids: &Tensor,
@@ -588,6 +590,7 @@ impl super::WithForward for Flux {
         timesteps: &Tensor,
         y: &Tensor,
         guidance: Option<&Tensor>,
+        hook: &dyn super::BlockHook,
     ) -> Result<Tensor> {
         if txt.rank() != 3 {
             candle::bail!("unexpected shape for txt {:?}", txt.shape())
@@ -612,15 +615,47 @@ impl super::WithForward for Flux {
         let vec_ = (vec_ + y.apply(&self.vector_in))?;
 
         // Double blocks
-        for block in self.double_blocks.iter() {
-            (img, txt) = block.forward(&img, &txt, &vec_, &pe)?
+        for (index, block) in self.double_blocks.iter().enumerate() {
+            (img, txt) = block.forward(&img, &txt, &vec_, &pe)?;
+            if let Some(replacement) = hook.after_double_block(index, &img, &txt)? {
+                img = super::accept_replacement("double", index, &img, replacement)?;
+            }
         }
         // Single blocks
+        let txt_len = txt.dim(1)?;
         let mut img = Tensor::cat(&[&txt, &img], 1)?;
-        for block in self.single_blocks.iter() {
+        for (index, block) in self.single_blocks.iter().enumerate() {
             img = block.forward(&img, &vec_, &pe)?;
+            if let Some(replacement) = hook.after_single_block(index, txt_len, &img)? {
+                img = super::accept_replacement("single", index, &img, replacement)?;
+            }
         }
-        let img = img.i((.., txt.dim(1)?..))?;
+        let img = img.i((.., txt_len..))?;
         self.final_layer.forward(&img, &vec_)
+    }
+}
+
+impl super::WithForward for Flux {
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_with_hook(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            &super::NoopBlockHook,
+        )
     }
 }

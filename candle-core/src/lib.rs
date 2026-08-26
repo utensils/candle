@@ -53,6 +53,7 @@ pub mod backend;
 pub mod backprop;
 pub mod conv;
 mod convert;
+pub mod convrot;
 pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
@@ -72,6 +73,7 @@ pub mod metal_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod nditer;
+pub mod neighborhood_attention;
 pub mod npy;
 pub mod op;
 pub mod pickle;

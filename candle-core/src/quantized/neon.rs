@@ -1099,7 +1099,7 @@ pub(crate) fn quantize_row_q8k(xs: &[f32], ys: &mut [BlockQ8K]) {
         xs.len()
     );
     unsafe {
-        for (chunk, y) in xs.chunks_exact(QK_K).zip(ys.iter_mut()) {
+        for (chunk, y) in xs.as_chunks::<QK_K>().0.iter().zip(ys.iter_mut()) {
             // Find the element with the maximum absolute value, preserving its sign.
             let (mut vabs_max0, mut vsmax0) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
             let (mut vabs_max1, mut vsmax1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
