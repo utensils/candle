@@ -49,6 +49,14 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
     ) -> Result<(CpuStorage, Shape)> {
         let [batch, time, height, width, heads, head_dim] =
             validate(q_layout, k_layout, v_layout, self.kernel)?;
+        if !matches!(
+            (q, k, v),
+            (CpuStorage::F32(_), CpuStorage::F32(_), CpuStorage::F32(_))
+        ) {
+            crate::bail!(
+                "CPU neighborhood attention supports matching F32 q, k, and v tensors only"
+            )
+        }
         let q = q.as_slice::<f32>()?;
         let k = k.as_slice::<f32>()?;
         let v = v.as_slice::<f32>()?;
@@ -273,6 +281,60 @@ mod tests {
             .iter()
             .zip(actual)
             .all(|(expected, actual)| (expected - actual).abs() < 1e-4));
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_half_types_match_f32_reference() -> Result<()> {
+        let values: Vec<f32> = (0..54).map(|index| index as f32 / 20.0).collect();
+        let q = Tensor::from_vec(values.clone(), (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 3, 3, 3, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [3, 3, 3], 2f32.sqrt().recip())?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let metal = Device::new_metal(0)?;
+        for (dtype, tolerance) in [(DType::F16, 3e-3), (DType::BF16, 3e-2)] {
+            let actual = neighborhood_attention3d(
+                &q.to_dtype(dtype)?.to_device(&metal)?,
+                &k.to_dtype(dtype)?.to_device(&metal)?,
+                &v.to_dtype(dtype)?.to_device(&metal)?,
+                [3, 3, 3],
+                2f32.sqrt().recip(),
+            )?;
+            metal.synchronize()?;
+            let actual = actual
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(
+                expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| (expected - actual).abs() < tolerance),
+                "{dtype:?} Metal neighborhood attention exceeded tolerance {tolerance}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_rejects_kernel_above_threadgroup_memory_limit() -> Result<()> {
+        let metal = Device::new_metal(0)?;
+        let tensor = Tensor::ones((1, 33, 33, 33, 1, 1), DType::F32, &metal)?;
+        let error = neighborhood_attention3d(&tensor, &tensor, &tensor, [33, 33, 33], 1.0)
+            .expect_err("oversized threadgroup allocation must fail before dispatch");
+        assert!(
+            error.to_string().contains("threadgroup memory"),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 }

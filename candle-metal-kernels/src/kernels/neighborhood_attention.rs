@@ -1,7 +1,7 @@
 use crate::utils::{BufferOffset, EncoderProvider};
 use crate::{debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels};
 use crate::{DType, MetalKernelError, Output, Source};
-use objc2_metal::MTLSize;
+use objc2_metal::{MTLDevice, MTLSize};
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_neighborhood_attention3d(
@@ -33,6 +33,28 @@ pub fn call_neighborhood_attention3d(
             ))
         }
     };
+    let neighbors = kernel
+        .into_iter()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| {
+            MetalKernelError::InvalidInput(
+                "neighborhood-attention kernel volume overflows usize".to_string(),
+            )
+        })?;
+    let threadgroup_bytes = neighbors
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            MetalKernelError::InvalidInput(
+                "neighborhood-attention threadgroup byte count overflows usize".to_string(),
+            )
+        })?;
+    let threadgroup_limit = device.as_ref().maxThreadgroupMemoryLength();
+    if threadgroup_bytes > threadgroup_limit {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "neighborhood-attention kernel {kernel:?} requires {threadgroup_bytes} bytes of threadgroup memory, but this Metal device supports {threadgroup_limit}"
+        )));
+    }
+
     let pipeline = kernels.load_pipeline(device, Source::NeighborhoodAttention, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -59,7 +81,7 @@ pub fn call_neighborhood_attention3d(
             scale
         )
     );
-    encoder.set_threadgroup_memory_length(0, kernel.iter().product::<usize>() * 4);
+    encoder.set_threadgroup_memory_length(0, threadgroup_bytes);
     encoder.dispatch_thread_groups(
         MTLSize {
             width: batch * time * height * width,
