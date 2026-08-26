@@ -135,7 +135,7 @@ pub fn dequantize_int8_convrot_256(packed: &Tensor, scales: &Tensor) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Device;
+    use crate::{DType, Device};
 
     fn reference_input(rows: usize) -> Vec<u8> {
         (0..rows * GROUP_SIZE)

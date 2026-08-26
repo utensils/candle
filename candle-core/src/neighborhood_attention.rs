@@ -217,7 +217,7 @@ pub fn neighborhood_attention3d(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Device;
+    use crate::{DType, Device};
 
     #[test]
     fn one_voxel_window_returns_values() -> Result<()> {
