@@ -1,4 +1,6 @@
-use crate::{CpuStorage, DType, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use crate::DType;
+use crate::{CpuStorage, Layout, Result, Shape, Tensor};
 use half::bf16;
 
 const GROUP_SIZE: usize = 256;

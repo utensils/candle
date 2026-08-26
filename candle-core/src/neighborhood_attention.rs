@@ -1,4 +1,6 @@
-use crate::{CpuStorage, DType, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use crate::DType;
+use crate::{CpuStorage, Layout, Result, Shape, Tensor};
 
 #[derive(Debug, Clone, Copy)]
 struct NeighborhoodAttention3d {
@@ -263,7 +265,10 @@ mod tests {
         )?;
         metal.synchronize()?;
         let expected = expected.flatten_all()?.to_vec1::<f32>()?;
-        let actual = actual.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         assert!(expected
             .iter()
             .zip(actual)
