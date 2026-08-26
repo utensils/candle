@@ -69,7 +69,10 @@ impl crate::CustomOp2 for DequantizeInt8ConvRot256 {
         let mut group = [0f32; GROUP_SIZE];
         for row in 0..rows {
             let scale = scales[if scale_count == 1 { 0 } else { row }] / 16.0;
-            for packed_group in packed[row * cols..(row + 1) * cols].chunks_exact(GROUP_SIZE) {
+            for packed_group in packed[row * cols..(row + 1) * cols]
+                .as_chunks::<GROUP_SIZE>()
+                .0
+            {
                 for (value, byte) in group.iter_mut().zip(packed_group) {
                     *value = (*byte as i8) as f32;
                 }
