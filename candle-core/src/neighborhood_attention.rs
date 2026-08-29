@@ -21,16 +21,23 @@ fn validate(q: &Layout, k: &Layout, v: &Layout, kernel: [usize; 3]) -> Result<[u
     if kernel.iter().any(|size| *size == 0 || size % 2 == 0) {
         crate::bail!("neighborhood attention kernels must be positive odd sizes")
     }
-    if kernel[0] > *time || kernel[1] > *height || kernel[2] > *width {
-        crate::bail!(
-            "neighborhood attention kernel {:?} exceeds input grid [{time},{height},{width}]",
-            kernel
-        )
-    }
     if *head_dim == 0 || *head_dim > 256 {
         crate::bail!("neighborhood attention head dimension must be in 1..=256")
     }
     Ok([*batch, *time, *height, *width, *heads, *head_dim])
+}
+
+/// Clamp each kernel axis to its grid extent.
+///
+/// A requested kernel wider than the axis it slides over cannot describe a
+/// real sliding window on that axis: NATTEN boundary-window semantics
+/// degrade to full attention there instead (every query on that axis
+/// attends across the whole axis, `start = 0`). The requested `kernel`
+/// itself must stay a positive odd triple (checked by `validate`); the
+/// clamped value returned here is what every backend actually loops over,
+/// and it may be even when an axis extent is even.
+fn effective_kernel(kernel: [usize; 3], time: usize, height: usize, width: usize) -> [usize; 3] {
+    [kernel[0].min(time), kernel[1].min(height), kernel[2].min(width)]
 }
 
 impl crate::CustomOp3 for NeighborhoodAttention3d {
@@ -63,31 +70,26 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
         let q = &q[q_layout.start_offset()..];
         let k = &k[k_layout.start_offset()..];
         let v = &v[v_layout.start_offset()..];
+        let kernel = effective_kernel(self.kernel, time, height, width);
         let spatial = time * height * width;
-        let neighbors: usize = self.kernel.iter().product();
+        let neighbors: usize = kernel.iter().product();
         let mut output = vec![0f32; batch * spatial * heads * head_dim];
         let mut scores = vec![0f32; neighbors];
         for b in 0..batch {
             for qt in 0..time {
-                let start_t = qt
-                    .saturating_sub(self.kernel[0] / 2)
-                    .min(time - self.kernel[0]);
+                let start_t = qt.saturating_sub(kernel[0] / 2).min(time - kernel[0]);
                 for qh in 0..height {
-                    let start_h = qh
-                        .saturating_sub(self.kernel[1] / 2)
-                        .min(height - self.kernel[1]);
+                    let start_h = qh.saturating_sub(kernel[1] / 2).min(height - kernel[1]);
                     for qw in 0..width {
-                        let start_w = qw
-                            .saturating_sub(self.kernel[2] / 2)
-                            .min(width - self.kernel[2]);
+                        let start_w = qw.saturating_sub(kernel[2] / 2).min(width - kernel[2]);
                         let query_position = (qt * height + qh) * width + qw;
                         for head in 0..heads {
                             let query_base =
                                 ((b * spatial + query_position) * heads + head) * head_dim;
                             let mut index = 0;
-                            for dt in 0..self.kernel[0] {
-                                for dh in 0..self.kernel[1] {
-                                    for dw in 0..self.kernel[2] {
+                            for dt in 0..kernel[0] {
+                                for dh in 0..kernel[1] {
+                                    for dw in 0..kernel[2] {
                                         let key_position = ((start_t + dt) * height + start_h + dh)
                                             * width
                                             + start_w
@@ -119,9 +121,9 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
                             for d in 0..head_dim {
                                 let mut value = 0f32;
                                 let mut index = 0;
-                                for dt in 0..self.kernel[0] {
-                                    for dh in 0..self.kernel[1] {
-                                        for dw in 0..self.kernel[2] {
+                                for dt in 0..kernel[0] {
+                                    for dh in 0..kernel[1] {
+                                        for dw in 0..kernel[2] {
                                             let value_position =
                                                 ((start_t + dt) * height + start_h + dh) * width
                                                     + start_w
@@ -175,7 +177,8 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
             crate::bail!("unsupported neighborhood attention dtype {:?}", q.dtype())
         }
 
-        let neighbors: usize = self.kernel.iter().product();
+        let kernel = effective_kernel(self.kernel, time, height, width);
+        let neighbors: usize = kernel.iter().product();
         let threadgroup_bytes = neighbors * std::mem::size_of::<f32>();
         // Mirror the Metal backend's pre-dispatch guard: refuse before
         // touching the device rather than surfacing an opaque CUDA launch
@@ -186,7 +189,7 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
         if threadgroup_bytes > MAX_DEFAULT_SHARED_MEM_BYTES {
             crate::bail!(
                 "neighborhood attention kernel {:?} requires {threadgroup_bytes} bytes of shared memory, but the default CUDA per-block budget is {MAX_DEFAULT_SHARED_MEM_BYTES}",
-                self.kernel
+                kernel
             )
         }
 
@@ -284,7 +287,7 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
             width,
             heads,
             head_dim,
-            kernel: self.kernel,
+            kernel,
             scale: self.scale,
             threadgroup_bytes,
         }
@@ -314,6 +317,7 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
         if !matches!(q.dtype(), DType::F32 | DType::F16 | DType::BF16) {
             crate::bail!("unsupported neighborhood attention dtype {:?}", q.dtype())
         }
+        let kernel = effective_kernel(self.kernel, time, height, width);
         let device = q.device();
         let elements = q_layout.shape().elem_count();
         let output = device
@@ -339,7 +343,7 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
             width,
             heads,
             head_dim,
-            self.kernel,
+            kernel,
             self.scale,
             crate::metal_backend::buffer_o(q.buffer(), q_layout, q.dtype()),
             crate::metal_backend::buffer_o(k.buffer(), k_layout, k.dtype()),
@@ -616,6 +620,87 @@ mod tests {
             error.to_string().contains("shared memory"),
             "unexpected error: {error}"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matches_cpu_when_kernel_exceeds_grid_extent() -> Result<()> {
+        // Exact repro shape from a real LTX-2.5 diffusion-VAE smoke render:
+        // the checkpoint's fixed [11, 11, 11] window is wider than a
+        // 9-frame clip's time axis, so `time` must clamp to full attention
+        // while `height`/`width` keep sliding normally.
+        let elements = 9 * 64 * 64 * 2;
+        let values: Vec<f32> = (0..elements)
+            .map(|index| (index as f32 % 29.0) / 5.0)
+            .collect();
+        let q = Tensor::from_vec(values.clone(), (1, 9, 64, 64, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 9, 64, 64, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 9, 64, 64, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [11, 11, 11], 2f32.sqrt().recip())?;
+
+        let cuda = Device::new_cuda(0)?;
+        let actual = neighborhood_attention3d(
+            &q.to_device(&cuda)?,
+            &k.to_device(&cuda)?,
+            &v.to_device(&cuda)?,
+            [11, 11, 11],
+            2f32.sqrt().recip(),
+        )?;
+        cuda.synchronize()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| (expected - actual).abs() < 1e-3));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matches_cpu_when_kernel_exceeds_every_axis() -> Result<()> {
+        // Every axis clamps at once, including two EVEN extents (4): time=1
+        // clamps kernel_t 3 -> 1, height=4 and width=4 each clamp kernel_h
+        // and kernel_w 7 -> 4, so this degrades to full attention over the
+        // whole grid regardless of query position.
+        let values: Vec<f32> = (0..(4 * 4 * 2))
+            .map(|index| (index as f32 % 13.0) / 3.0)
+            .collect();
+        let q = Tensor::from_vec(values.clone(), (1, 1, 4, 4, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 1, 4, 4, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 1, 4, 4, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [3, 7, 7], 2f32.sqrt().recip())?;
+
+        let cuda = Device::new_cuda(0)?;
+        let actual = neighborhood_attention3d(
+            &q.to_device(&cuda)?,
+            &k.to_device(&cuda)?,
+            &v.to_device(&cuda)?,
+            [3, 7, 7],
+            2f32.sqrt().recip(),
+        )?;
+        cuda.synchronize()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| (expected - actual).abs() < 1e-4));
         Ok(())
     }
 }
