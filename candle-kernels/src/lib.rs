@@ -12,6 +12,7 @@ pub enum Id {
     Convrot,
     Fill,
     Indexing,
+    NeighborhoodAttention,
     Quantized,
     Reduce,
     Sort,
@@ -19,7 +20,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 12] = [
+pub const ALL_IDS: [Id; 13] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -27,6 +28,7 @@ pub const ALL_IDS: [Id; 12] = [
     Id::Convrot,
     Id::Fill,
     Id::Indexing,
+    Id::NeighborhoodAttention,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -76,6 +78,7 @@ mdl!(CONV, Conv);
 mdl!(CONVROT, Convrot);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
+mdl!(NEIGHBORHOOD_ATTENTION, NeighborhoodAttention);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);

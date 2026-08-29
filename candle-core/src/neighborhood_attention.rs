@@ -1,4 +1,4 @@
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::DType;
 use crate::{CpuStorage, Layout, Result, Shape, Tensor};
 
@@ -142,6 +142,157 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
             }
         }
         Ok((CpuStorage::F32(output), q_layout.shape().clone()))
+    }
+
+    /// CUDA twin of `metal_fwd`: one 256-thread block per (query position,
+    /// head), the same shared-memory score/softmax/accumulate phases as
+    /// `neighborhood_attention.metal`, one output buffer per dtype, no host
+    /// copy. Dispatches through `Map3` so the same code path handles F32,
+    /// F16, and BF16 without a per-dtype `unsafe` block.
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        q: &crate::CudaStorage,
+        q_layout: &Layout,
+        k: &crate::CudaStorage,
+        k_layout: &Layout,
+        v: &crate::CudaStorage,
+        v_layout: &Layout,
+    ) -> Result<(crate::CudaStorage, Shape)> {
+        use crate::backend::BackendStorage;
+        use crate::cuda_backend::cudarc::driver::{
+            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
+        };
+        use crate::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
+        use crate::{CudaDevice, WithDType};
+
+        let [batch, time, height, width, heads, head_dim] =
+            validate(q_layout, k_layout, v_layout, self.kernel)?;
+        if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
+            crate::bail!("neighborhood attention q, k, and v dtypes must match")
+        }
+        if !matches!(q.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+            crate::bail!("unsupported neighborhood attention dtype {:?}", q.dtype())
+        }
+
+        let neighbors: usize = self.kernel.iter().product();
+        let threadgroup_bytes = neighbors * std::mem::size_of::<f32>();
+        // Mirror the Metal backend's pre-dispatch guard: refuse before
+        // touching the device rather than surfacing an opaque CUDA launch
+        // failure. 48 KiB is the per-block dynamic shared memory budget
+        // guaranteed on every supported compute capability without an
+        // explicit `cudaFuncSetAttribute` opt-in.
+        const MAX_DEFAULT_SHARED_MEM_BYTES: usize = 48 * 1024;
+        if threadgroup_bytes > MAX_DEFAULT_SHARED_MEM_BYTES {
+            crate::bail!(
+                "neighborhood attention kernel {:?} requires {threadgroup_bytes} bytes of shared memory, but the default CUDA per-block budget is {MAX_DEFAULT_SHARED_MEM_BYTES}",
+                self.kernel
+            )
+        }
+
+        struct Launch {
+            batch: usize,
+            time: usize,
+            height: usize,
+            width: usize,
+            heads: usize,
+            head_dim: usize,
+            kernel: [usize; 3],
+            scale: f32,
+            threadgroup_bytes: usize,
+        }
+
+        impl Map3 for Launch {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                q: &CudaSlice<T>,
+                q_layout: &Layout,
+                k: &CudaSlice<T>,
+                k_layout: &Layout,
+                v: &CudaSlice<T>,
+                v_layout: &Layout,
+                dev: &CudaDevice,
+            ) -> Result<CudaSlice<T>> {
+                let q = match q_layout.contiguous_offsets() {
+                    Some((o1, o2)) => q.slice(o1..o2),
+                    None => crate::bail!("neighborhood attention requires contiguous q, k, and v"),
+                };
+                let k = match k_layout.contiguous_offsets() {
+                    Some((o1, o2)) => k.slice(o1..o2),
+                    None => crate::bail!("neighborhood attention requires contiguous q, k, and v"),
+                };
+                let v = match v_layout.contiguous_offsets() {
+                    Some((o1, o2)) => v.slice(o1..o2),
+                    None => crate::bail!("neighborhood attention requires contiguous q, k, and v"),
+                };
+                let elements =
+                    self.batch * self.time * self.height * self.width * self.heads * self.head_dim;
+                let func = dev.get_or_load_func(
+                    &kernel_name::<T>("neighborhood_attention3d"),
+                    &kernels::NEIGHBORHOOD_ATTENTION,
+                )?;
+                // SAFETY: every element is written by exactly one thread
+                // before the buffer is observed; the kernel covers
+                // `elements` outputs exactly.
+                let output = unsafe { dev.alloc::<T>(elements)? };
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        (self.batch * self.time * self.height * self.width) as u32,
+                        self.heads as u32,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: self.threadgroup_bytes as u32,
+                };
+                let time = self.time as u64;
+                let height = self.height as u64;
+                let width = self.width as u64;
+                let heads = self.heads as u64;
+                let head_dim = self.head_dim as u64;
+                let kernel_t = self.kernel[0] as u64;
+                let kernel_h = self.kernel[1] as u64;
+                let kernel_w = self.kernel[2] as u64;
+                let scale = self.scale;
+                let stream = dev.cuda_stream();
+                let mut builder = stream.launch_builder(&func);
+                builder
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&output)
+                    .arg(&time)
+                    .arg(&height)
+                    .arg(&width)
+                    .arg(&heads)
+                    .arg(&head_dim)
+                    .arg(&kernel_t)
+                    .arg(&kernel_h)
+                    .arg(&kernel_w)
+                    .arg(&scale);
+                // SAFETY: argument types and launch geometry match the
+                // kernel signature.
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(output)
+            }
+        }
+
+        let device = q.device().clone();
+        let slice = Launch {
+            batch,
+            time,
+            height,
+            width,
+            heads,
+            head_dim,
+            kernel: self.kernel,
+            scale: self.scale,
+            threadgroup_bytes,
+        }
+        .map(&q.slice, q_layout, &k.slice, k_layout, &v.slice, v_layout, &device)?;
+        Ok((
+            crate::cuda_backend::CudaStorage { slice, device },
+            q_layout.shape().clone(),
+        ))
     }
 
     #[cfg(feature = "metal")]
@@ -333,6 +484,136 @@ mod tests {
             .expect_err("oversized threadgroup allocation must fail before dispatch");
         assert!(
             error.to_string().contains("threadgroup memory"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matches_cpu_for_shifted_boundaries() -> Result<()> {
+        let values: Vec<f32> = (0..54).map(|index| index as f32 / 10.0).collect();
+        let q = Tensor::from_vec(values.clone(), (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 3, 3, 3, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [3, 3, 3], 2f32.sqrt().recip())?;
+
+        let cuda = Device::new_cuda(0)?;
+        let actual = neighborhood_attention3d(
+            &q.to_device(&cuda)?,
+            &k.to_device(&cuda)?,
+            &v.to_device(&cuda)?,
+            [3, 3, 3],
+            2f32.sqrt().recip(),
+        )?;
+        cuda.synchronize()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| (expected - actual).abs() < 1e-4));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matches_cpu_for_an_asymmetric_kernel() -> Result<()> {
+        // Mirrors the diffusion VAE's real kernel shapes (e.g. [3, 7, 7]),
+        // where every axis clamps its window start independently and the
+        // grid dimensions differ from one another.
+        let elements = 5 * 7 * 9 * 2;
+        let values: Vec<f32> = (0..elements)
+            .map(|index| (index as f32 % 23.0) / 4.0)
+            .collect();
+        let q = Tensor::from_vec(values.clone(), (1, 5, 7, 9, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 5, 7, 9, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 5, 7, 9, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [3, 5, 7], 2f32.sqrt().recip())?;
+
+        let cuda = Device::new_cuda(0)?;
+        let actual = neighborhood_attention3d(
+            &q.to_device(&cuda)?,
+            &k.to_device(&cuda)?,
+            &v.to_device(&cuda)?,
+            [3, 5, 7],
+            2f32.sqrt().recip(),
+        )?;
+        cuda.synchronize()?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| (expected - actual).abs() < 1e-3));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_half_types_match_f32_reference() -> Result<()> {
+        let values: Vec<f32> = (0..54).map(|index| index as f32 / 20.0).collect();
+        let q = Tensor::from_vec(values.clone(), (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let k = Tensor::from_vec(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            (1, 3, 3, 3, 1, 2),
+            &Device::Cpu,
+        )?;
+        let v = Tensor::from_vec(values, (1, 3, 3, 3, 1, 2), &Device::Cpu)?;
+        let expected = neighborhood_attention3d(&q, &k, &v, [3, 3, 3], 2f32.sqrt().recip())?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let cuda = Device::new_cuda(0)?;
+        for (dtype, tolerance) in [(DType::F16, 3e-3), (DType::BF16, 3e-2)] {
+            let actual = neighborhood_attention3d(
+                &q.to_dtype(dtype)?.to_device(&cuda)?,
+                &k.to_dtype(dtype)?.to_device(&cuda)?,
+                &v.to_dtype(dtype)?.to_device(&cuda)?,
+                [3, 3, 3],
+                2f32.sqrt().recip(),
+            )?;
+            cuda.synchronize()?;
+            let actual = actual
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(
+                expected
+                    .iter()
+                    .zip(actual)
+                    .all(|(expected, actual)| (expected - actual).abs() < tolerance),
+                "{dtype:?} CUDA neighborhood attention exceeded tolerance {tolerance}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_rejects_kernel_above_shared_mem_limit() -> Result<()> {
+        let cuda = Device::new_cuda(0)?;
+        // 33^3 * 4 bytes = 143,748 bytes, comfortably above the 48 KiB
+        // default dynamic shared memory budget checked before dispatch.
+        let tensor = Tensor::ones((1, 33, 33, 33, 1, 1), DType::F32, &cuda)?;
+        let error = neighborhood_attention3d(&tensor, &tensor, &tensor, [33, 33, 33], 1.0)
+            .expect_err("oversized shared memory allocation must fail before dispatch");
+        assert!(
+            error.to_string().contains("shared memory"),
             "unexpected error: {error}"
         );
         Ok(())
