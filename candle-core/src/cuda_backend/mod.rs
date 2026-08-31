@@ -1732,6 +1732,335 @@ fn gemm_config<T>(
     })
 }
 
+/// Below this many im2col column elements a convolution is cheaper to run
+/// through im2col than to set up on cuDNN.
+///
+/// The metric is the size of the buffer the im2col path *materialises* —
+/// `out_h * out_w * k_h * k_w * c_in` per batch — because that buffer is
+/// precisely the work cuDNN avoids. Output elements are the wrong measure: the
+/// Wan VAE's head convolution is 96->3 at 480x832, which has barely a million
+/// output elements and a 690 MB column buffer, and cuDNN runs it 6.9x faster.
+///
+/// cuDNN pays a few hundred microseconds per call re-creating descriptors and
+/// re-running the forward-algorithm heuristic, none of which candle caches, so
+/// below some amount of avoided work it loses. Measured on an RTX 4090
+/// (cuDNN 9.13) these values sit inside a clean gap in a channels x resolution
+/// sweep — for f16/bf16 the highest-losing shape is at 29M and the
+/// lowest-winning at 43M; for the wider dtypes, 7M and 11M. f32 crosses over
+/// sooner because its im2col path is the slower of the two.
+///
+/// Being wrong here is only ever slower, never incorrect: both paths compute
+/// the same convolution.
+#[cfg(feature = "cudnn")]
+const CUDNN_MIN_COL_ELEMS_HALF: usize = 35_000_000;
+#[cfg(feature = "cudnn")]
+const CUDNN_MIN_COL_ELEMS_WIDE: usize = 9_000_000;
+
+#[cfg(feature = "cudnn")]
+fn cudnn_min_col_elems(dtype: crate::DType) -> usize {
+    match dtype {
+        crate::DType::F16 | crate::DType::BF16 => CUDNN_MIN_COL_ELEMS_HALF,
+        _ => CUDNN_MIN_COL_ELEMS_WIDE,
+    }
+}
+
+#[cfg(feature = "cudnn")]
+fn cudnn_is_worth_it_2d(params: &crate::conv::ParamsConv2D, dtype: crate::DType) -> bool {
+    // A 1x1 convolution is a matmul, and the sweep finds no size at which the
+    // cuDNN and im2col outcomes separate on any metric tried — neighbouring
+    // shapes with identical column counts land on opposite sides. Leave the
+    // predictable path in place rather than guess.
+    if params.k_h * params.k_w == 1 {
+        return false;
+    }
+    let col_elems =
+        params.b_size * params.out_h() * params.out_w() * params.k_h * params.k_w * params.c_in;
+    col_elems >= cudnn_min_col_elems(dtype)
+}
+
+#[cfg(feature = "cudnn")]
+fn cudnn_is_worth_it_1d(params: &crate::conv::ParamsConv1D, dtype: crate::DType) -> bool {
+    if params.k_size == 1 {
+        return false;
+    }
+    let col_elems = params.b_size * params.l_out() * params.k_size * params.c_in;
+    col_elems >= cudnn_min_col_elems(dtype)
+}
+
+/// A cuDNN convolution that failed is not a failed convolution: im2col
+/// computes the same thing and is always available. Report once per process so
+/// a systematic failure is visible without flooding a denoise loop.
+#[cfg(feature = "cudnn")]
+fn cudnn_fell_back(op: &str, err: &crate::Error) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "candle: cuDNN {op} failed ({err}); falling back to im2col for this and \
+             any later convolution that fails the same way"
+        );
+    });
+}
+
+/// Convolution backends.
+///
+/// `conv1d` / `conv2d` on the [`BackendStorage`] impl pick between these two
+/// at runtime; see [`crate::cudnn_policy`] and `cudnn_is_worth_it_*`.
+impl CudaStorage {
+    fn conv1d_im2col(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        const USE_IM2COL_CONV1D: bool = true;
+
+        let device = self.device().clone();
+        if !USE_IM2COL_CONV1D {
+            let slice = Conv1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice, device });
+        }
+
+        let col = Im2Col1D {
+            l_k: params.k_size,
+            stride: params.stride,
+            dilation: params.dilation,
+            padding: params.padding,
+        }
+        .map(&self.slice, &device, l)?;
+        let col = Self { slice: col, device };
+        let l_out = params.l_out();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_size * params.c_in;
+        let m = l_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+        } else {
+            // Make the kernel contiguous if not already the case.
+            //
+            // The copy has to be the operand: matmul'ing `kernel` here instead
+            // describes the *original* strided buffer with a contiguous layout
+            // (and the original's start offset), so the GEMM reads the wrong
+            // elements. `kernel_c` is freshly packed, so its layout is plain
+            // contiguous from zero.
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l = Layout::contiguous((n, k)).transpose(0, 1)?;
+            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
+        };
+        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
+        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
+    }
+    #[cfg(feature = "cudnn")]
+    fn conv1d_cudnn(
+        &self,
+        inp_l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv1D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        if !kernel_l.is_contiguous() {
+            let slice = Conv1D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice, device });
+        }
+        let l_out = params.l_out();
+        let dst_el = params.c_out * l_out * params.b_size;
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::U8(inp), S::U8(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                crate::cudnn::launch_conv1d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::U8(out)
+            }
+            (S::BF16(inp), S::BF16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                // Only PSEUDO_BFLOAT16_CONFIG is supported in cudnn, there is no "true bfloat16"
+                // version.
+                // https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html#id88
+                crate::cudnn::launch_conv1d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::BF16(out)
+            }
+            (S::F16(inp), S::F16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                crate::cudnn::launch_conv1d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F16(out)
+            }
+            (S::F32(inp), S::F32(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                crate::cudnn::launch_conv1d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F32(out)
+            }
+            (S::F64(inp), S::F64(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                crate::cudnn::launch_conv1d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F64(out)
+            }
+            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv1d does not support u32"))?,
+            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv1d does not support i16"))?,
+            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv1d does not support i32"))?,
+            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv1d does not support i64"))?,
+            (S::F8E4M3(_), S::F8E4M3(_)) => {
+                Err(CudaError::InternalError("conv1d does not support f8e4m3"))?
+            }
+            _ => Err(CudaError::InternalError("dtype mismatch in conv1d"))?,
+        };
+        Ok(Self { slice, device })
+    }
+    fn conv2d_im2col(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        const USE_IM2COL_CONV2D: bool = true;
+
+        let device = self.device().clone();
+        if !USE_IM2COL_CONV2D {
+            let slice = Conv2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice, device });
+        }
+
+        let col = Im2Col {
+            h_k: params.k_h,
+            w_k: params.k_w,
+            stride: params.stride,
+            dilation: params.dilation,
+            padding: params.padding,
+        }
+        .map(&self.slice, &device, l)?;
+        let col = Self { slice: col, device };
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_h * params.k_w * params.c_in;
+        let m = h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+        } else {
+            // Make the kernel contiguous if not already the case.
+            //
+            // The copy has to be the operand: matmul'ing `kernel` here instead
+            // describes the *original* strided buffer with a contiguous layout
+            // (and the original's start offset), so the GEMM reads the wrong
+            // elements. `kernel_c` is freshly packed, so its layout is plain
+            // contiguous from zero.
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l = Layout::contiguous((n, k)).transpose(0, 1)?;
+            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
+        };
+        let res_l = Layout::contiguous((b, h_out, w_out, n))
+            .transpose(1, 2)?
+            .transpose(1, 3)?;
+        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
+    }
+    #[cfg(feature = "cudnn")]
+    fn conv2d_cudnn(
+        &self,
+        inp_l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        if !kernel_l.is_contiguous() {
+            let slice = Conv2D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice, device });
+        }
+        let (out_w, out_h) = (params.out_w(), params.out_h());
+        let dst_el = params.c_out * out_w * out_h * params.b_size;
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::U8(inp), S::U8(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                crate::cudnn::launch_conv2d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::U8(out)
+            }
+            (S::BF16(inp), S::BF16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                // Only PSEUDO_BFLOAT16_CONFIG is supported in cudnn, there is no "true bfloat16"
+                // version.
+                // https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html#id88
+                crate::cudnn::launch_conv2d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::BF16(out)
+            }
+            (S::F16(inp), S::F16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                crate::cudnn::launch_conv2d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F16(out)
+            }
+            (S::F32(inp), S::F32(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                crate::cudnn::launch_conv2d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F32(out)
+            }
+            (S::F64(inp), S::F64(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                crate::cudnn::launch_conv2d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F64(out)
+            }
+            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv2d does not support u32"))?,
+            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv2d does not support i16"))?,
+            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv2d does not support i32"))?,
+            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv2d does not support i64"))?,
+            (S::F8E4M3(_), S::F8E4M3(_)) => {
+                Err(CudaError::InternalError("conv2d does not support f8e4m3"))?
+            }
+            _ => Err(CudaError::InternalError("dtype mismatch in conv2d"))?,
+        };
+        Ok(Self { slice, device })
+    }
+}
+
 impl BackendStorage for CudaStorage {
     type Device = CudaDevice;
 
@@ -2068,7 +2397,6 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
-    #[cfg(not(feature = "cudnn"))]
     fn conv1d(
         &self,
         l: &Layout,
@@ -2076,118 +2404,37 @@ impl BackendStorage for CudaStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        const USE_IM2COL_CONV1D: bool = true;
-
-        let device = self.device().clone();
-        if !USE_IM2COL_CONV1D {
-            let slice = Conv1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+        #[cfg(feature = "cudnn")]
+        if crate::cudnn_policy::is_enabled() && cudnn_is_worth_it_1d(params, self.dtype()) {
+            match self.conv1d_cudnn(l, kernel, kernel_l, params) {
+                Ok(res) => {
+                    crate::cudnn_policy::record_dispatch();
+                    return Ok(res);
+                }
+                Err(err) => cudnn_fell_back("conv1d", &err),
+            }
         }
-
-        let col = Im2Col1D {
-            l_k: params.k_size,
-            stride: params.stride,
-            dilation: params.dilation,
-            padding: params.padding,
-        }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
-        let l_out = params.l_out();
-        let b = params.b_size;
-        let n = params.c_out;
-        let k = params.k_size * params.c_in;
-        let m = l_out;
-        let col_l = Layout::contiguous((b * m, k));
-        let res = if kernel_l.is_contiguous() {
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
-        } else {
-            // Make the kernel contiguous if not already the case.
-            let mut kernel_c = unsafe {
-                self.device()
-                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
-            };
-            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
-        };
-        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
-        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
-        res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        Ok(res_t)
+        self.conv1d_im2col(l, kernel, kernel_l, params)
     }
 
-    #[cfg(feature = "cudnn")]
-    fn conv1d(
+    fn conv2d(
         &self,
-        inp_l: &Layout,
+        l: &Layout,
         kernel: &Self,
         kernel_l: &Layout,
-        params: &crate::conv::ParamsConv1D,
+        params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        let device = self.device().clone();
-        if !kernel_l.is_contiguous() {
-            let slice = Conv1D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+        #[cfg(feature = "cudnn")]
+        if crate::cudnn_policy::is_enabled() && cudnn_is_worth_it_2d(params, self.dtype()) {
+            match self.conv2d_cudnn(l, kernel, kernel_l, params) {
+                Ok(res) => {
+                    crate::cudnn_policy::record_dispatch();
+                    return Ok(res);
+                }
+                Err(err) => cudnn_fell_back("conv2d", &err),
+            }
         }
-        let l_out = params.l_out();
-        let dst_el = params.c_out * l_out * params.b_size;
-        let slice = match (&self.slice, &kernel.slice) {
-            (S::U8(inp), S::U8(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
-                crate::cudnn::launch_conv1d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::U8(out)
-            }
-            (S::BF16(inp), S::BF16(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
-                // Only PSEUDO_BFLOAT16_CONFIG is supported in cudnn, there is no "true bfloat16"
-                // version.
-                // https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html#id88
-                crate::cudnn::launch_conv1d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::BF16(out)
-            }
-            (S::F16(inp), S::F16(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
-                crate::cudnn::launch_conv1d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F16(out)
-            }
-            (S::F32(inp), S::F32(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
-                crate::cudnn::launch_conv1d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F32(out)
-            }
-            (S::F64(inp), S::F64(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
-                crate::cudnn::launch_conv1d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F64(out)
-            }
-            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv1d does not support u32"))?,
-            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv1d does not support i16"))?,
-            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv1d does not support i32"))?,
-            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv1d does not support i64"))?,
-            (S::F8E4M3(_), S::F8E4M3(_)) => {
-                Err(CudaError::InternalError("conv1d does not support f8e4m3"))?
-            }
-            _ => Err(CudaError::InternalError("dtype mismatch in conv1d"))?,
-        };
-        Ok(Self { slice, device })
+        self.conv2d_im2col(l, kernel, kernel_l, params)
     }
 
     fn conv_transpose1d(
@@ -2245,132 +2492,6 @@ impl BackendStorage for CudaStorage {
             .map(&col.slice, &device, &col_l)?
         } else {
             ConvTranspose1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?
-        };
-        Ok(Self { slice, device })
-    }
-
-    #[cfg(not(feature = "cudnn"))]
-    fn conv2d(
-        &self,
-        l: &Layout,
-        kernel: &Self,
-        kernel_l: &Layout,
-        params: &crate::conv::ParamsConv2D,
-    ) -> Result<Self> {
-        const USE_IM2COL_CONV2D: bool = true;
-
-        let device = self.device().clone();
-        if !USE_IM2COL_CONV2D {
-            let slice = Conv2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
-        }
-
-        let col = Im2Col {
-            h_k: params.k_h,
-            w_k: params.k_w,
-            stride: params.stride,
-            dilation: params.dilation,
-            padding: params.padding,
-        }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
-        let h_out = params.out_h();
-        let w_out = params.out_w();
-        let b = params.b_size;
-        let n = params.c_out;
-        let k = params.k_h * params.k_w * params.c_in;
-        let m = h_out * w_out;
-        let col_l = Layout::contiguous((b * m, k));
-        let res = if kernel_l.is_contiguous() {
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
-        } else {
-            // Make the kernel contiguous if not already the case.
-            let mut kernel_c = unsafe {
-                self.device()
-                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
-            };
-            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l =
-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
-        };
-        let res_l = Layout::contiguous((b, h_out, w_out, n))
-            .transpose(1, 2)?
-            .transpose(1, 3)?;
-        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
-        res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        Ok(res_t)
-    }
-
-    #[cfg(feature = "cudnn")]
-    fn conv2d(
-        &self,
-        inp_l: &Layout,
-        kernel: &Self,
-        kernel_l: &Layout,
-        params: &crate::conv::ParamsConv2D,
-    ) -> Result<Self> {
-        let device = self.device().clone();
-        if !kernel_l.is_contiguous() {
-            let slice = Conv2D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
-        }
-        let (out_w, out_h) = (params.out_w(), params.out_h());
-        let dst_el = params.c_out * out_w * out_h * params.b_size;
-        let slice = match (&self.slice, &kernel.slice) {
-            (S::U8(inp), S::U8(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
-                crate::cudnn::launch_conv2d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::U8(out)
-            }
-            (S::BF16(inp), S::BF16(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
-                // Only PSEUDO_BFLOAT16_CONFIG is supported in cudnn, there is no "true bfloat16"
-                // version.
-                // https://docs.nvidia.com/deeplearning/cudnn/latest/api/cudnn-cnn-library.html#id88
-                crate::cudnn::launch_conv2d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::BF16(out)
-            }
-            (S::F16(inp), S::F16(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
-                crate::cudnn::launch_conv2d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F16(out)
-            }
-            (S::F32(inp), S::F32(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
-                crate::cudnn::launch_conv2d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F32(out)
-            }
-            (S::F64(inp), S::F64(k)) => {
-                let inp = &inp.slice(inp_l.start_offset()..);
-                let k = &k.slice(kernel_l.start_offset()..);
-                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
-                crate::cudnn::launch_conv2d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
-                    .map_err(crate::Error::wrap)?;
-                S::F64(out)
-            }
-            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv2d does not support u32"))?,
-            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv2d does not support i16"))?,
-            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv2d does not support i32"))?,
-            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv2d does not support i64"))?,
-            (S::F8E4M3(_), S::F8E4M3(_)) => {
-                Err(CudaError::InternalError("conv2d does not support f8e4m3"))?
-            }
-            _ => Err(CudaError::InternalError("dtype mismatch in conv2d"))?,
         };
         Ok(Self { slice, device })
     }

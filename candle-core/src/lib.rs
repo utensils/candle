@@ -58,6 +58,7 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+pub mod cudnn_policy;
 mod custom_op;
 mod device;
 pub mod display;
