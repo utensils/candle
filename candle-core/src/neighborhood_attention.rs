@@ -37,7 +37,11 @@ fn validate(q: &Layout, k: &Layout, v: &Layout, kernel: [usize; 3]) -> Result<[u
 /// clamped value returned here is what every backend actually loops over,
 /// and it may be even when an axis extent is even.
 fn effective_kernel(kernel: [usize; 3], time: usize, height: usize, width: usize) -> [usize; 3] {
-    [kernel[0].min(time), kernel[1].min(height), kernel[2].min(width)]
+    [
+        kernel[0].min(time),
+        kernel[1].min(height),
+        kernel[2].min(width),
+    ]
 }
 
 impl crate::CustomOp3 for NeighborhoodAttention3d {
@@ -291,7 +295,9 @@ impl crate::CustomOp3 for NeighborhoodAttention3d {
             scale: self.scale,
             threadgroup_bytes,
         }
-        .map(&q.slice, q_layout, &k.slice, k_layout, &v.slice, v_layout, &device)?;
+        .map(
+            &q.slice, q_layout, &k.slice, k_layout, &v.slice, v_layout, &device,
+        )?;
         Ok((
             crate::cuda_backend::CudaStorage { slice, device },
             q_layout.shape().clone(),
