@@ -146,6 +146,11 @@ pub(crate) fn launch_conv2d<
             dst,
         )?;
     }
+    // Counted here rather than at the dispatch decision: the caller's cuDNN
+    // arm can still hand a non-contiguous kernel to Candle's own Conv2D
+    // kernel and return successfully, and counting that would report work
+    // cuDNN never did to the parity tests that gate on this number.
+    crate::cudnn_policy::record_dispatch();
     Ok(())
 }
 
@@ -251,5 +256,6 @@ pub(crate) fn launch_conv1d<
             dst,
         )?;
     }
+    crate::cudnn_policy::record_dispatch();
     Ok(())
 }

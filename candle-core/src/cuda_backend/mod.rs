@@ -2406,11 +2406,11 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         #[cfg(feature = "cudnn")]
         if crate::cudnn_policy::is_enabled() && cudnn_is_worth_it_1d(params, self.dtype()) {
+            // No dispatch count here: this arm returns Ok even when it
+            // handed a non-contiguous kernel to Candle's own Conv1D
+            // kernel. `launch_conv1d` counts the launches cuDNN really ran.
             match self.conv1d_cudnn(l, kernel, kernel_l, params) {
-                Ok(res) => {
-                    crate::cudnn_policy::record_dispatch();
-                    return Ok(res);
-                }
+                Ok(res) => return Ok(res),
                 Err(err) => cudnn_fell_back("conv1d", &err),
             }
         }
@@ -2426,11 +2426,11 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         #[cfg(feature = "cudnn")]
         if crate::cudnn_policy::is_enabled() && cudnn_is_worth_it_2d(params, self.dtype()) {
+            // No dispatch count here: this arm returns Ok even when it
+            // handed a non-contiguous kernel to Candle's own Conv2D
+            // kernel. `launch_conv2d` counts the launches cuDNN really ran.
             match self.conv2d_cudnn(l, kernel, kernel_l, params) {
-                Ok(res) => {
-                    crate::cudnn_policy::record_dispatch();
-                    return Ok(res);
-                }
+                Ok(res) => return Ok(res),
                 Err(err) => cudnn_fell_back("conv2d", &err),
             }
         }

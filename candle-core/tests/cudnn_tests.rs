@@ -17,6 +17,39 @@
 
 use candle_core::{cudnn_policy, DType, Device, IndexOp, Result, Tensor};
 
+/// A CUDA device, but only in a build that can actually dispatch to cuDNN.
+///
+/// `cuda` without `cudnn` is a supported configuration: the device opens, the
+/// convolutions run, and `is_enabled()` is permanently false. Every comparison
+/// below would then observe zero dispatches and fail for a reason that is not
+/// a defect, so the whole suite opts out instead.
+fn cudnn_device() -> Option<Device> {
+    if !cudnn_policy::is_compiled() {
+        return None;
+    }
+    Device::new_cuda(0).ok()
+}
+
+/// Whether this GPU can run `dtype` convolutions on cuDNN at all.
+///
+/// bf16 convolution needs SM80+; on an older card cuDNN cannot execute it, the
+/// backend deliberately falls back to im2col, and demanding a dispatch would
+/// fail the suite on hardware it is supposed to support. Probing with a shape
+/// known to clear the threshold separates "this card cannot" from "the
+/// dispatch decision is wrong" — the latter must still fail, so the per-shape
+/// dispatch assertions below stay exactly as strict.
+fn cudnn_runs_dtype(dev: &Device, dtype: DType) -> Result<bool> {
+    let (c_in, c_out, h, w, k, pad) = DISPATCHING_SHAPES[0];
+    let x = Tensor::randn(0f32, 1.0, (1, c_in, h, w), dev)?.to_dtype(dtype)?;
+    let wt = Tensor::randn(0f32, 0.05, (c_out, c_in, k, k), dev)?.to_dtype(dtype)?;
+    let prev = cudnn_policy::set_enabled(true);
+    let before = cudnn_policy::dispatch_count();
+    let _ = x.conv2d(&wt, pad, 1, 1, 1)?;
+    let dispatched = cudnn_policy::dispatch_count() - before;
+    cudnn_policy::set_enabled(prev);
+    Ok(dispatched > 0)
+}
+
 /// Run `f` with cuDNN forced on, then forced off, and hand back both results.
 /// Fails if the first run never reached cuDNN.
 fn both_paths<T>(what: &str, f: impl Fn() -> Result<T>) -> Result<(T, T)> {
@@ -59,6 +92,10 @@ const DISPATCHING_SHAPES: &[(usize, usize, usize, usize, usize, usize)] = &[
 ];
 
 fn conv2d_paths_agree(dev: &Device, dtype: DType, tol: f32) -> Result<()> {
+    if !cudnn_runs_dtype(dev, dtype)? {
+        eprintln!("skipping {dtype:?}: this GPU's cuDNN cannot execute it");
+        return Ok(());
+    }
     for &(c_in, c_out, h, w, k, pad) in DISPATCHING_SHAPES {
         let x = Tensor::randn(0f32, 1.0, (1, c_in, h, w), dev)?.to_dtype(dtype)?;
         let wt = Tensor::randn(0f32, 0.05, (c_out, c_in, k, k), dev)?.to_dtype(dtype)?;
@@ -76,7 +113,7 @@ fn conv2d_paths_agree(dev: &Device, dtype: DType, tol: f32) -> Result<()> {
 
 #[test]
 fn cudnn_and_im2col_agree_f32() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     // FMA math forbids TF32, so f32 stays genuinely f32 on both paths. A
@@ -86,7 +123,7 @@ fn cudnn_and_im2col_agree_f32() -> Result<()> {
 
 #[test]
 fn cudnn_and_im2col_agree_bf16() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     conv2d_paths_agree(&dev, DType::BF16, 2e-2)
@@ -94,7 +131,7 @@ fn cudnn_and_im2col_agree_bf16() -> Result<()> {
 
 #[test]
 fn cudnn_and_im2col_agree_f16() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     conv2d_paths_agree(&dev, DType::F16, 2e-2)
@@ -102,13 +139,21 @@ fn cudnn_and_im2col_agree_f16() -> Result<()> {
 
 #[test]
 fn cudnn_and_im2col_agree_on_strided_input() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     // A non-contiguous source takes cudnn's `create_4d_tensor_ex` stride path,
     // which is the arm most likely to be wired up wrong.
-    let x = Tensor::randn(0f32, 1.0, (2, 64, 240, 416), &dev)?.to_dtype(DType::F32)?;
-    let x = x.narrow(0, 1, 1)?;
+    // Narrowing only the batch dim would NOT do this: candle ignores strides
+    // on length-1 dimensions, so the result is still `is_contiguous()` and
+    // silently takes the ordinary descriptor. Narrowing width leaves the row
+    // stride at the original 416 and is genuinely non-contiguous.
+    let x = Tensor::randn(0f32, 1.0, (1, 64, 240, 416), &dev)?.to_dtype(DType::F32)?;
+    let x = x.narrow(3, 8, 400)?;
+    assert!(
+        !x.is_contiguous(),
+        "this test is pointless unless the input is actually strided"
+    );
     let wt = Tensor::randn(0f32, 0.05, (96, 64, 3, 3), &dev)?.to_dtype(DType::F32)?;
     let (a, b) = both_paths("strided input", || x.conv2d(&wt, 1, 1, 1, 1))?;
     assert!(
@@ -120,7 +165,7 @@ fn cudnn_and_im2col_agree_on_strided_input() -> Result<()> {
 
 #[test]
 fn cudnn_and_im2col_agree_with_stride_and_dilation() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     let x = Tensor::randn(0f32, 1.0, (1, 128, 480, 832), &dev)?.to_dtype(DType::F32)?;
@@ -139,7 +184,7 @@ fn cudnn_and_im2col_agree_with_stride_and_dilation() -> Result<()> {
 
 #[test]
 fn grouped_convolutions_agree() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     // candle chunks groups *above* the backend, so the cuDNN path only ever
@@ -157,7 +202,7 @@ fn grouped_convolutions_agree() -> Result<()> {
 
 #[test]
 fn conv1d_paths_agree() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     let x = Tensor::randn(0f32, 1.0, (1, 128, 40_000), &dev)?.to_dtype(DType::F32)?;
@@ -170,19 +215,22 @@ fn conv1d_paths_agree() -> Result<()> {
 
 #[test]
 fn shapes_below_the_threshold_stay_on_im2col() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     let prev = cudnn_policy::set_enabled(true);
     // A 1x1 convolution is a matmul: im2col's column buffer is a free reshape,
     // so cuDNN can only add per-call setup. And a small convolution finishes
     // in less time than cuDNN spends creating descriptors.
-    let cases: &[(
-        &str,
+    // A named alias: the bare nested tuple trips `clippy::type_complexity`,
+    // and this crate's CI runs clippy over tests with `-D warnings`.
+    type BelowThresholdCase = (
+        &'static str,
         (usize, usize, usize, usize),
         (usize, usize, usize, usize),
         usize,
-    )] = &[
+    );
+    let cases: &[BelowThresholdCase] = &[
         (
             "1x1 pointwise, large",
             (1, 256, 240, 416),
@@ -208,7 +256,7 @@ fn shapes_below_the_threshold_stay_on_im2col() -> Result<()> {
 
 #[test]
 fn disabling_the_policy_routes_everything_to_im2col() -> Result<()> {
-    let Ok(dev) = Device::new_cuda(0) else {
+    let Some(dev) = cudnn_device() else {
         return Ok(());
     };
     let x = Tensor::ones((1, 64, 240, 416), DType::F32, &dev)?;
