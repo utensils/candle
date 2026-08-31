@@ -1,4 +1,4 @@
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::DType;
 use crate::{CpuStorage, Layout, Result, Shape, Tensor};
 use half::bf16;
@@ -83,6 +83,67 @@ impl crate::CustomOp2 for DequantizeInt8ConvRot256 {
         Ok((CpuStorage::BF16(output), (rows, cols).into()))
     }
 
+    /// CUDA twin of `metal_fwd`: one 256-thread block per (row, group), the
+    /// same shared-memory butterfly, one BF16 output buffer, no host copy.
+    /// Bit-identical to `cpu_fwd`: every butterfly intermediate is an exact
+    /// integer below 2^24, the scale multiply is by an exact power of two
+    /// times the stored scale, and the narrowing is round-to-nearest-even on
+    /// both sides.
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        packed: &crate::CudaStorage,
+        packed_layout: &Layout,
+        scales: &crate::CudaStorage,
+        scales_layout: &Layout,
+    ) -> Result<(crate::CudaStorage, Shape)> {
+        use crate::backend::BackendStorage;
+        use crate::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use crate::cuda_backend::{kernels, WrapErr};
+
+        let (rows, cols, scale_count) = validate_layouts(packed_layout, scales_layout)?;
+        if packed.dtype() != DType::U8 || scales.dtype() != DType::F32 {
+            crate::bail!(
+                "INT8 ConvRot expects U8 bytes and F32 scales, got {:?} and {:?}",
+                packed.dtype(),
+                scales.dtype()
+            )
+        }
+        let device = packed.device().clone();
+        let packed = packed
+            .as_cuda_slice::<u8>()?
+            .slice(packed_layout.start_offset()..);
+        let scales = scales
+            .as_cuda_slice::<f32>()?
+            .slice(scales_layout.start_offset()..);
+        // SAFETY: every element is written by exactly one thread before the
+        // buffer is observed; the kernel covers rows * cols elements exactly.
+        let output = unsafe { device.alloc::<bf16>(rows * cols)? };
+        let func =
+            device.get_or_load_func("dequantize_int8_convrot_256_bf16", &kernels::CONVROT)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, (cols / GROUP_SIZE) as u32, 1),
+            block_dim: (GROUP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cols = cols as u64;
+        let scale_count = scale_count as u64;
+        let stream = device.cuda_stream();
+        let mut builder = stream.launch_builder(&func);
+        builder
+            .arg(&packed)
+            .arg(&scales)
+            .arg(&output)
+            .arg(&cols)
+            .arg(&scale_count);
+        // SAFETY: argument types and launch geometry match the kernel signature.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok((
+            crate::CudaStorage::wrap_cuda_slice(output, device),
+            (rows, cols as usize).into(),
+        ))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -129,8 +190,9 @@ impl crate::CustomOp2 for DequantizeInt8ConvRot256 {
 
 /// Reconstruct tensorwise signed INT8 ConvRot weights in 256-value groups.
 ///
-/// Metal execution allocates one BF16 output buffer and 1 KiB of threadgroup
-/// memory per active group. It does not allocate full-size intermediate tensors.
+/// Metal and CUDA execution allocate one BF16 output buffer and 1 KiB of
+/// threadgroup/shared memory per active group. Neither allocates full-size
+/// intermediate tensors, and all three backends are bit-identical.
 pub fn dequantize_int8_convrot_256(packed: &Tensor, scales: &Tensor) -> Result<Tensor> {
     packed.apply_op2_no_bwd(scales, &DequantizeInt8ConvRot256)
 }
@@ -156,6 +218,39 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_matches_cpu_for_tiny_bounded_inputs() -> Result<()> {
+        let cpu_packed = Tensor::from_vec(reference_input(3), (3, GROUP_SIZE), &Device::Cpu)?;
+        let cpu_scales = Tensor::new(&[0.25f32, 0.5, 0.75], &Device::Cpu)?;
+        let expected = dequantize_int8_convrot_256(&cpu_packed, &cpu_scales)?;
+
+        let cuda = Device::new_cuda(0)?;
+        let actual = dequantize_int8_convrot_256(
+            &cpu_packed.to_device(&cuda)?,
+            &cpu_scales.to_device(&cuda)?,
+        )?;
+        cuda.synchronize()?;
+        assert_eq!(
+            actual.to_device(&Device::Cpu)?.to_vec2::<bf16>()?,
+            expected.to_vec2::<bf16>()?
+        );
+
+        // Two groups per row with a single shared scale exercises the grid's
+        // group dimension and the scale_count == 1 branch.
+        let wide = Tensor::from_vec(reference_input(6), (3, 2 * GROUP_SIZE), &Device::Cpu)?;
+        let shared_scale = Tensor::new(&[0.3f32], &Device::Cpu)?;
+        let expected = dequantize_int8_convrot_256(&wide, &shared_scale)?;
+        let actual =
+            dequantize_int8_convrot_256(&wide.to_device(&cuda)?, &shared_scale.to_device(&cuda)?)?;
+        cuda.synchronize()?;
+        assert_eq!(
+            actual.to_device(&Device::Cpu)?.to_vec2::<bf16>()?,
+            expected.to_vec2::<bf16>()?
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn metal_matches_cpu_for_tiny_bounded_inputs() -> Result<()> {
@@ -173,6 +268,22 @@ mod tests {
             actual.to_device(&Device::Cpu)?.to_vec2::<bf16>()?,
             expected.to_vec2::<bf16>()?
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "explicit 192 MiB CUDA residency smoke test"]
+    fn cuda_largest_ltx25_weight_stays_bounded() -> Result<()> {
+        const ROWS: usize = 16_384;
+        const COLS: usize = 4_096;
+        let cuda = Device::new_cuda(0)?;
+        let packed = Tensor::zeros((ROWS, COLS), DType::U8, &cuda)?;
+        let scales = Tensor::ones(ROWS, DType::F32, &cuda)?;
+        let output = dequantize_int8_convrot_256(&packed, &scales)?;
+        cuda.synchronize()?;
+        assert_eq!(output.dims(), &[ROWS, COLS]);
+        assert_eq!(output.dtype(), DType::BF16);
         Ok(())
     }
 

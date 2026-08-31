@@ -48,3 +48,6 @@ bria.mp3
 bria.safetensors
 bria.wav
 bench_results/
+
+# Local agent workspace (worktrees, notes) — never part of the fork.
+.claude/
