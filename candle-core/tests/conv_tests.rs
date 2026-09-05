@@ -1019,3 +1019,110 @@ test_device!(
     conv2d_grad_noncontiguous_kernel_gpu,
     conv2d_grad_noncontiguous_kernel_metal
 );
+
+// Crosses batch boundaries and leaves a partial spatial tile, with noncontiguous views.
+#[cfg(feature = "metal")]
+#[test]
+fn conv2d_metal_bounded_workspace() -> Result<()> {
+    use candle_core::DType;
+    let metal = Device::new_metal(0)?;
+    for (case, pad, stride, dilation, noncontig, channels) in [
+        (0, 1, 1, 1, false, 64),
+        (1, 2, 2, 2, true, 64),
+        (2, 1, 1, 1, false, 256),
+    ] {
+        let x = Tensor::from_vec(
+            (0..2 * channels * 129 * 257)
+                .map(|i| ((i * 97 % 251) as f32 - 125.) / 128.)
+                .collect::<Vec<_>>(),
+            (2, channels, 129, 257),
+            &Device::Cpu,
+        )?;
+        let w = Tensor::from_vec(
+            (0..5 * channels * 3 * 3)
+                .map(|i| ((i * 31 % 97) as f32 - 48.) / 1024.)
+                .collect::<Vec<_>>(),
+            (5, channels, 3, 3),
+            &Device::Cpu,
+        )?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let x = x.to_dtype(dtype)?;
+            let w = w.to_dtype(dtype)?;
+            let mut xm = x.to_device(&metal)?;
+            let mut wm = w.to_device(&metal)?;
+            let (x, w) = if noncontig {
+                xm = xm.transpose(2, 3)?;
+                wm = wm.transpose(2, 3)?;
+                (x.transpose(2, 3)?, w.transpose(2, 3)?)
+            } else {
+                (x.clone(), w.clone())
+            };
+            let expected = x
+                .to_dtype(DType::F32)?
+                .conv2d(&w.to_dtype(DType::F32)?, pad, stride, dilation, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            eprintln!("conv case={case} dtype={dtype:?} Metal start");
+            let actual = xm
+                .conv2d(&wm, pad, stride, dilation, 1)?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(actual.len(), expected.len());
+            if actual.iter().any(|v| !v.is_finite()) {
+                anyhow::bail!("nonfinite");
+            }
+            let rel = (actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum::<f64>()
+                / expected.iter().map(|v| (*v as f64).powi(2)).sum::<f64>())
+            .sqrt();
+            println!("case={case} dtype={dtype:?} relative_l2={rel}");
+            let tol = if dtype == DType::F32 { 1e-4 } else { 0.02 };
+            if rel > tol {
+                anyhow::bail!("parity failure {rel}");
+            }
+            metal.synchronize()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn conv2d_metal_result_bounded_and_offset_kernel() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    // Large output/patch ratio selects tiles from the GEMM result bound.
+    // Kernel is contiguous with a nonzero offset; exact binary fractions avoid tolerance ambiguity.
+    for width in [17, 16401] {
+        let x = Tensor::from_vec(
+            (0..width)
+                .map(|i| (i % 17) as f32 / 16.)
+                .collect::<Vec<_>>(),
+            (1, 1, 1, width),
+            &dev,
+        )?;
+        let kernel = Tensor::from_vec(
+            (0..1025).map(|i| (i % 11) as f32 / 16.).collect::<Vec<_>>(),
+            (1025, 1, 1, 1),
+            &dev,
+        )?
+        .narrow(0, 1, 1024)?;
+        let out = x
+            .conv2d(&kernel, 0, 1, 1, 1)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for c in 0..1024 {
+            for i in 0..width {
+                assert_eq!(
+                    out[c * width + i],
+                    ((c + 1) % 11) as f32 * (i % 17) as f32 / 256.
+                );
+            }
+        }
+    }
+    Ok(())
+}

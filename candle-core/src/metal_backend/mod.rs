@@ -17,6 +17,95 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
+fn conv2d_full(
+    storage: &MetalStorage,
+    layout: &Layout,
+    kernel: &MetalStorage,
+    kernel_l: &Layout,
+    params: &ParamsConv2D,
+) -> Result<MetalStorage> {
+    let device = storage.device().clone();
+    let shape = layout.shape();
+    let dims = shape.dims();
+
+    let stride = params.stride;
+    let dilation = params.dilation;
+    let padding = params.padding;
+    let h_k = params.k_h;
+    let w_k = params.k_w;
+    let h = dims[2];
+    let w = dims[3];
+    let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
+    let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
+    let dst_el = dims[0] * h_out * w_out * dims[1] * h_k * w_k;
+
+    let dst = storage
+        .device
+        .new_buffer_builder()
+        .with_size_for(dst_el, storage.dtype)
+        .with_label("conv2d_im2col")
+        .build()?;
+    let encoder = storage.device.command_encoder()?;
+    let name = match storage.dtype {
+        DType::F32 => "im2col_f32",
+        DType::F16 => "im2col_f16",
+        DType::BF16 => "im2col_bf16",
+        DType::U8 => "im2col_u8",
+        DType::U32 => "im2col_u32",
+        dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
+    };
+    let src = buffer_o(&storage.buffer, layout, storage.dtype);
+    candle_metal_kernels::call_im2col_strided(
+        &storage.device.device,
+        &encoder,
+        &storage.device.kernels,
+        name,
+        layout.shape().dims(),
+        layout.stride(),
+        (h_k, w_k, stride, padding, dilation),
+        src,
+        &dst,
+    )
+    .map_err(MetalError::from)?;
+    drop(encoder);
+    let col = MetalStorage {
+        buffer: dst,
+        device,
+        count: dst_el,
+        dtype: storage.dtype,
+    };
+    let h_out = params.out_h();
+    let w_out = params.out_w();
+    let b = params.b_size;
+    let n = params.c_out;
+    let k = params.k_h * params.k_w * params.c_in;
+    let m = h_out * w_out;
+    let col_l = Layout::contiguous((b, m, k));
+    let res = if kernel_l.is_contiguous() {
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            .transpose(1, 2)?
+            .broadcast_as((b, k, n))?;
+        col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+    } else {
+        // Make the kernel contiguous if not already the case.
+        let mut kernel_c = storage
+            .device()
+            .zeros_impl(kernel_l.shape(), kernel.dtype())?;
+        kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
+            .transpose(1, 2)?
+            .broadcast_as((b, k, n))?;
+        col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
+    };
+    let res_l = Layout::contiguous((b, h_out, w_out, n))
+        .transpose(1, 2)?
+        .transpose(1, 3)?;
+    let mut res_t = storage.device().zeros_impl(res_l.shape(), res.dtype())?;
+    res.copy_strided_src(&mut res_t, 0, &res_l)?;
+    Ok(res_t)
+}
+
+mod conv2d_plan;
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
@@ -1109,83 +1198,111 @@ impl BackendStorage for MetalStorage {
         kernel_l: &Layout,
         params: &ParamsConv2D,
     ) -> Result<Self> {
-        let device = self.device().clone();
-        let shape = layout.shape();
-        let dims = shape.dims();
-
-        let stride = params.stride;
-        let dilation = params.dilation;
-        let padding = params.padding;
-        let h_k = params.k_h;
-        let w_k = params.k_w;
-        let h = dims[2];
-        let w = dims[3];
-        let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
-        let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
-        let dst_el = dims[0] * h_out * w_out * dims[1] * h_k * w_k;
-
-        let dst = self
+        // Partition independent output pixels, as CPU conv2d_tiled does. Unlike VAE
+        // image tiling, every patch reads the original full tensor and padding.
+        let m = params
+            .out_h()
+            .checked_mul(params.out_w())
+            .ok_or_else(|| Error::Msg("Metal conv2d spatial size overflow".into()))?;
+        let n = params.c_out;
+        let k = params
+            .k_h
+            .checked_mul(params.k_w)
+            .and_then(|v| v.checked_mul(params.c_in))
+            .ok_or_else(|| Error::Msg("Metal conv2d patch size overflow".into()))?;
+        let rows = params
+            .b_size
+            .checked_mul(m)
+            .ok_or_else(|| Error::Msg("Metal conv2d spatial size overflow".into()))?;
+        let plan = conv2d_plan::plan(rows, k, n, self.dtype.size_in_bytes())?;
+        if plan.rows_per_tile == rows {
+            return conv2d_full(self, layout, kernel, kernel_l, params);
+        }
+        let tile_rows = plan.rows_per_tile;
+        let dst_el = plan.output_elements;
+        let output = self
             .device
-            .new_buffer_builder()
-            .with_size_for(dst_el, self.dtype)
-            .with_label("conv2d_im2col")
-            .build()?;
-        let encoder = self.device.command_encoder()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col_f32",
-            DType::F16 => "im2col_f16",
-            DType::BF16 => "im2col_bf16",
-            DType::U8 => "im2col_u8",
-            DType::U32 => "im2col_u32",
+            .new_buffer(dst_el, self.dtype, "conv2d_output")?;
+        let workspace = self
+            .device
+            .new_buffer(tile_rows * k, self.dtype, "conv2d_im2col")?;
+        let (im2col_name, scatter_name) = match self.dtype {
+            DType::F32 => ("im2col_f32", "conv_scatter_f32"),
+            DType::F16 => ("im2col_f16", "conv_scatter_f16"),
+            DType::BF16 => ("im2col_bf16", "conv_scatter_bf16"),
             dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
         };
-        let src = buffer_o(&self.buffer, layout, self.dtype);
-        candle_metal_kernels::call_im2col_strided(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            layout.shape().dims(),
-            layout.stride(),
-            (h_k, w_k, stride, padding, dilation),
-            src,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
-        drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
-        let h_out = params.out_h();
-        let w_out = params.out_w();
-        let b = params.b_size;
-        let n = params.c_out;
-        let k = params.k_h * params.k_w * params.c_in;
-        let m = h_out * w_out;
-        let col_l = Layout::contiguous((b, m, k));
-        let res = if kernel_l.is_contiguous() {
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+        let mut packed_kernel = None;
+        if !kernel_l.is_contiguous() {
+            let mut packed = self.device.zeros_impl(kernel_l.shape(), kernel.dtype())?;
+            kernel.copy_strided_src(&mut packed, 0, kernel_l)?;
+            packed_kernel = Some(packed);
+        }
+        let kernel_offset = if packed_kernel.is_some() {
+            0
         } else {
-            // Make the kernel contiguous if not already the case.
-            let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
-            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            kernel_l.start_offset()
         };
-        let res_l = Layout::contiguous((b, h_out, w_out, n))
-            .transpose(1, 2)?
-            .transpose(1, 3)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
-        res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        Ok(res_t)
+        let kernel = packed_kernel.as_ref().unwrap_or(kernel);
+        let kernel_layout =
+            Layout::contiguous_with_offset((1, n, k), kernel_offset).transpose(1, 2)?;
+        for (tile_index, offset) in (0..rows).step_by(tile_rows).enumerate() {
+            let count = tile_rows.min(rows - offset);
+            let encoder = self.device.command_encoder()?;
+            candle_metal_kernels::call_im2col_strided_range(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                im2col_name,
+                layout.dims(),
+                layout.stride(),
+                (
+                    params.k_h,
+                    params.k_w,
+                    params.stride,
+                    params.padding,
+                    params.dilation,
+                ),
+                offset,
+                count,
+                buffer_o(&self.buffer, layout, self.dtype),
+                &workspace,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            let col = Self::new(
+                workspace.clone(),
+                self.device.clone(),
+                tile_rows * k,
+                self.dtype,
+            );
+            let result = col.matmul(
+                kernel,
+                (1, count, n, k),
+                &Layout::contiguous((1, count, k)),
+                &kernel_layout,
+            )?;
+            let encoder = self.device.command_encoder()?;
+            candle_metal_kernels::call_conv2d_scatter(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                scatter_name,
+                count,
+                offset,
+                m,
+                n,
+                &result.buffer,
+                &output,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            // Bound in-flight GEMM results as well as the shared im2col workspace.
+            if (tile_index + 1) % 8 == 0 || offset + count == rows {
+                self.device.flush_and_wait_current()?;
+            }
+        }
+        Ok(Self::new(output, self.device.clone(), dst_el, self.dtype))
     }
 
     fn conv_transpose2d(
