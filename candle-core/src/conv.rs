@@ -297,6 +297,9 @@ impl Tensor {
         self.conv2d_with_algo(kernel, padding, stride, dilation, groups, None)
     }
 
+    /// An explicit cuDNN algorithm bypasses the automatic CUDA size heuristic
+    /// when the thread's cuDNN policy is enabled. Disabling the policy still
+    /// selects im2col, and an unsupported cuDNN launch may still fall back.
     pub fn conv2d_with_algo(
         &self,
         kernel: &Self,
