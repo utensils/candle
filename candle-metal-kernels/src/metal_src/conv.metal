@@ -7,6 +7,7 @@ using namespace metal;
 template <typename T>
 METAL_FUNC void im2col(
     constant size_t &dst_numel,
+    constant size_t &spatial_offset,
     constant size_t &h_out,
     constant size_t &w_out,
     constant size_t &h_k,
@@ -36,7 +37,7 @@ METAL_FUNC void im2col(
   const size_t dst_s1 = w_out * dst_s2;
   const size_t dst_s0 = h_out * dst_s1;
 
-  size_t tmp_tid = tid;
+  size_t tmp_tid = size_t(tid) + spatial_offset * dst_s2;
   const size_t b_idx = tmp_tid / dst_s0;
   tmp_tid -= b_idx * dst_s0;
   const size_t h_idx = tmp_tid / dst_s1;
@@ -286,6 +287,7 @@ METAL_FUNC void upsample_bilinear2d(
 #define IM2COL_OP(T, FN_NAME) \
 kernel void FN_NAME(  \
     constant size_t &dst_numel, \
+    constant size_t &spatial_offset, \
     constant size_t &h_out, \
     constant size_t &w_out, \
     constant size_t &h_k, \
@@ -299,7 +301,7 @@ kernel void FN_NAME(  \
     device T *dst, \
     uint tid [[ thread_position_in_grid ]] \
 ) {  \
-  im2col<T>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
+  im2col<T>(dst_numel, spatial_offset, h_out, w_out, h_k, w_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
 } \
 
 #define IM2COL1D_OP(T, FN_NAME) \
@@ -714,4 +716,22 @@ CONVT2D_OP(float, float, conv_transpose2d_f32)
 CONVT2D_OP(half, float, conv_transpose2d_f16)
 #if defined(__HAVE_BFLOAT__)
 CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
+#endif
+
+// Scatter independent flattened (batch, spatial) GEMM rows into NCHW.
+#define CONV_SCATTER(T, NAME) \
+kernel void NAME(constant size_t &count, constant size_t &offset, \
+ constant size_t &spatial, constant size_t &channels, \
+ device const T *src, device T *dst, uint tid [[thread_position_in_grid]]) { \
+ if (size_t(tid) >= count) return; \
+ const size_t row = size_t(tid) / channels + offset; \
+ const size_t channel = size_t(tid) % channels; \
+ dst[(row / spatial * channels + channel) * spatial + row % spatial] = src[tid]; \
+}
+CONV_SCATTER(float, conv_scatter_f32)
+CONV_SCATTER(half, conv_scatter_f16)
+CONV_SCATTER(uint8_t, conv_scatter_u8)
+CONV_SCATTER(uint32_t, conv_scatter_u32)
+#if defined(__HAVE_BFLOAT__)
+CONV_SCATTER(bfloat, conv_scatter_bf16)
 #endif

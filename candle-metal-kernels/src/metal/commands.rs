@@ -23,6 +23,28 @@ fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, 
     )
 }
 
+// Injectable completion state permits testing asynchronous errors without a GPU fault.
+trait CommandCompletion {
+    fn status(&self) -> MTLCommandBufferStatus;
+    fn commit(&self);
+    fn wait_until_completed(&self);
+    fn error(&self) -> Option<String>;
+}
+impl CommandCompletion for CommandBuffer {
+    fn status(&self) -> MTLCommandBufferStatus {
+        CommandBuffer::status(self)
+    }
+    fn commit(&self) {
+        CommandBuffer::commit(self)
+    }
+    fn wait_until_completed(&self) {
+        CommandBuffer::wait_until_completed(self)
+    }
+    fn error(&self) -> Option<String> {
+        CommandBuffer::error(self).map(|e| e.into_owned())
+    }
+}
+
 /// RAII guard for compute command encoder operations.
 pub struct CommandsGuard<'a> {
     guard: MutexGuard<'a, EntryState>,
@@ -241,22 +263,7 @@ impl Commands {
             std::mem::take(&mut state.in_flight)
         };
 
-        // Wait only on the last CB. Metal executes CBs in queue order, so all earlier
-        // CBs are guaranteed complete when the last one is. Calling waitUntilCompleted on
-        // each CB individually pays OS notification latency (~1-2ms) N times unnecessarily.
-        if let Some(last) = to_wait.last() {
-            Self::ensure_completed(last)?;
-        }
-        // Check earlier CBs for errors (no need to block — they're already done).
-        for cb in &to_wait[..to_wait.len().saturating_sub(1)] {
-            if cb.status() == MTLCommandBufferStatus::Error {
-                let msg = cb
-                    .error()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown error".to_string());
-                return Err(MetalKernelError::CommandBufferError(msg));
-            }
-        }
+        Self::complete_prefix(&to_wait)?;
 
         self.prev_ce_outputs.lock()?.clear();
 
@@ -267,14 +274,14 @@ impl Commands {
     /// [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
     /// `flush_and_wait` on another thread may already have taken, returning before our work ran.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
-        let cb = {
+        // Retain the prefix so a concurrent drain cannot hide an earlier failure.
+        let to_wait = {
             let mut state = self.state.lock()?;
             self.commit_swap_locked(&mut state, 0)?;
-            state.in_flight.last().cloned()
+            state.in_flight.clone()
         };
-        if let Some(cb) = cb {
-            Self::ensure_completed(&cb)?;
-            // queue is FIFO: everything committed before cb is done too
+        Self::complete_prefix(&to_wait)?;
+        if !to_wait.is_empty() {
             let mut state = self.state.lock()?;
             state
                 .in_flight
@@ -314,7 +321,23 @@ impl Commands {
         Ok(())
     }
 
-    fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
+    // Queue order makes waiting on the last buffer sufficient, but every terminal
+    // status still matters: a successful readback must not hide a failed producer.
+    fn complete_prefix<C: CommandCompletion>(buffers: &[C]) -> Result<(), MetalKernelError> {
+        if let Some(last) = buffers.last() {
+            Self::ensure_completed(last)?;
+        }
+        for cb in buffers {
+            if cb.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalKernelError::CommandBufferError(
+                    cb.error().unwrap_or_else(|| "unknown error".into()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_completed<C: CommandCompletion>(cb: &C) -> Result<(), MetalKernelError> {
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 cb.commit();
@@ -334,6 +357,12 @@ impl Commands {
             _ => unreachable!(),
         }
 
+        // waitUntilCompleted may transition Scheduled/Committed to Error.
+        if cb.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalKernelError::CommandBufferError(
+                cb.error().unwrap_or_else(|| "unknown error".into()),
+            ));
+        }
         Ok(())
     }
 
@@ -385,5 +414,61 @@ impl Commands {
 impl Drop for Commands {
     fn drop(&mut self) {
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::cell::Cell;
+    struct Pending {
+        status: Cell<MTLCommandBufferStatus>,
+        terminal: MTLCommandBufferStatus,
+    }
+    impl CommandCompletion for Pending {
+        fn status(&self) -> MTLCommandBufferStatus {
+            self.status.get()
+        }
+        fn commit(&self) {
+            self.status.set(MTLCommandBufferStatus::Committed);
+        }
+        fn wait_until_completed(&self) {
+            self.status.set(self.terminal);
+        }
+        fn error(&self) -> Option<String> {
+            Some("late GPU failure".into())
+        }
+    }
+    #[test]
+    fn completion_propagates_failure_arriving_during_wait() {
+        let cb = Pending {
+            status: Cell::new(MTLCommandBufferStatus::Scheduled),
+            terminal: MTLCommandBufferStatus::Error,
+        };
+        assert!(Commands::ensure_completed(&cb).is_err());
+    }
+    #[test]
+    fn completed_readback_does_not_hide_failed_producer() {
+        let buffers = [
+            Pending {
+                status: Cell::new(MTLCommandBufferStatus::Error),
+                terminal: MTLCommandBufferStatus::Error,
+            },
+            Pending {
+                status: Cell::new(MTLCommandBufferStatus::Scheduled),
+                terminal: MTLCommandBufferStatus::Completed,
+            },
+        ];
+        assert!(Commands::complete_prefix(&buffers).is_err());
+        assert_eq!(buffers[1].status(), MTLCommandBufferStatus::Completed);
+    }
+    #[test]
+    fn completion_accepts_success_after_commit() {
+        let cb = Pending {
+            status: Cell::new(MTLCommandBufferStatus::NotEnqueued),
+            terminal: MTLCommandBufferStatus::Completed,
+        };
+        Commands::ensure_completed(&cb).unwrap();
+        assert_eq!(cb.status.get(), MTLCommandBufferStatus::Completed);
     }
 }
