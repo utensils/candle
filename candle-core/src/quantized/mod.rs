@@ -23,6 +23,8 @@ mod metal {
 #[cfg(feature = "cuda")]
 pub mod cuda;
 #[cfg(feature = "cuda")]
+pub(crate) mod cuda_workspace;
+#[cfg(feature = "cuda")]
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
 pub mod fast_mmvq;

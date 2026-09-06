@@ -66,6 +66,7 @@ pub struct CudaDevice {
     pub(crate) blas_lt: Arc<cudarc::cublaslt::CudaBlasLT>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+    pub(crate) quantized_workspaces: Arc<crate::quantized::cuda_workspace::QuantizedWorkspaces>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -411,6 +412,7 @@ impl CudaDevice {
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
+            quantized_workspaces: Arc::default(),
         })
     }
 }
