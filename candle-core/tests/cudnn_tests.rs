@@ -278,3 +278,59 @@ fn disabling_the_policy_routes_everything_to_im2col() -> Result<()> {
     );
     Ok(())
 }
+
+/// Half storage must retain float accumulation, including cancellation across
+/// channels. A half compute descriptor can pass the broad 2% smoke bound above
+/// while introducing several ulps of error at every VAE convolution.
+#[test]
+fn cudnn_f16_convolution_preserves_float_accumulation() -> Result<()> {
+    let Some(dev) = cudnn_device() else {
+        return Ok(());
+    };
+    let signal = |count: usize, scale: f32, phase: f32| {
+        (0..count)
+            .map(|i| ((i as f32 * 0.017) + phase).sin() * scale)
+            .collect::<Vec<_>>()
+    };
+    let x = Tensor::from_vec(signal(256 * 128 * 128, 1., 0.), (1, 256, 128, 128), &dev)?
+        .to_dtype(DType::F16)?;
+    let weight = Tensor::from_vec(signal(32 * 256 * 9, 0.05, 0.7), (32, 256, 3, 3), &dev)?
+        .to_dtype(DType::F16)?;
+    let (actual, reference) =
+        both_paths("F16 float accumulation", || x.conv2d(&weight, 1, 1, 1, 1))?;
+    assert_eq!(actual.dtype(), DType::F16);
+    let deviation = relative_deviation(&actual, &reference)?;
+    eprintln!("F16 cuDNN accumulation relative deviation: {deviation}");
+    assert!(
+        deviation <= 0.001,
+        "F16 convolution loses float accumulation: {deviation}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cudnn_f16_conv1d_preserves_float_accumulation() -> Result<()> {
+    let Some(dev) = cudnn_device() else {
+        return Ok(());
+    };
+    let signal = |count: usize, phase: f32| {
+        (0..count)
+            .map(|i| (i as f32 * 0.017 + phase).sin())
+            .collect::<Vec<_>>()
+    };
+    let x =
+        Tensor::from_vec(signal(128 * 60_000, 0.), (1, 128, 60_000), &dev)?.to_dtype(DType::F16)?;
+    let weight = (Tensor::from_vec(signal(32 * 128 * 5, 0.7), (32, 128, 5), &dev)? * 0.05)?
+        .to_dtype(DType::F16)?;
+    let (actual, reference) = both_paths("F16 Conv1D float accumulation", || {
+        x.conv1d(&weight, 2, 1, 1, 1)
+    })?;
+    assert_eq!(actual.dtype(), DType::F16);
+    let deviation = relative_deviation(&actual, &reference)?;
+    eprintln!("F16 Conv1D cuDNN accumulation relative deviation: {deviation}");
+    assert!(
+        deviation <= 0.001,
+        "F16 Conv1D loses float accumulation: {deviation}"
+    );
+    Ok(())
+}
