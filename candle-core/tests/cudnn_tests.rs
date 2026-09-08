@@ -17,6 +17,37 @@
 
 use candle_core::{cudnn_policy, DType, Device, IndexOp, Result, Tensor};
 
+#[test]
+fn explicit_algorithm_bypasses_size_heuristic_but_not_disabled_policy() -> Result<()> {
+    let Some(dev) = cudnn_device() else {
+        return Ok(());
+    };
+    let x = Tensor::zeros((1, 3, 16, 16), DType::F16, &dev)?;
+    let w = Tensor::zeros((4, 3, 3, 3), DType::F16, &dev)?;
+    let algo = Some(candle_core::conv::CudnnFwdAlgo::ImplicitPrecompGemm);
+    let previous = cudnn_policy::set_enabled(true);
+    let before = cudnn_policy::dispatch_count();
+    let automatic = x.conv2d(&w, 1, 1, 1, 1)?;
+    assert_eq!(cudnn_policy::dispatch_count(), before);
+    let explicit = x.conv2d_with_algo(&w, 1, 1, 1, 1, algo)?;
+    let enabled_count = cudnn_policy::dispatch_count() - before;
+    cudnn_policy::set_enabled(false);
+    let disabled = x.conv2d_with_algo(&w, 1, 1, 1, 1, algo)?;
+    let disabled_count = cudnn_policy::dispatch_count() - before;
+    cudnn_policy::set_enabled(previous);
+    assert_eq!(
+        enabled_count, 1,
+        "explicit algorithm was ignored below the threshold"
+    );
+    assert_eq!(
+        disabled_count, enabled_count,
+        "explicit algorithm overrode disabled policy"
+    );
+    assert_eq!(explicit.dims(), automatic.dims());
+    assert_eq!(explicit.dims(), disabled.dims());
+    Ok(())
+}
+
 /// A CUDA device, but only in a build that can actually dispatch to cuDNN.
 ///
 /// `cuda` without `cudnn` is a supported configuration: the device opens, the
@@ -275,6 +306,62 @@ fn disabling_the_policy_routes_everything_to_im2col() -> Result<()> {
     assert!(
         (interior - 576.0).abs() < 1e-3,
         "expected 576.0, got {interior}"
+    );
+    Ok(())
+}
+
+/// Half storage must retain float accumulation, including cancellation across
+/// channels. A half compute descriptor can pass the broad 2% smoke bound above
+/// while introducing several ulps of error at every VAE convolution.
+#[test]
+fn cudnn_f16_convolution_preserves_float_accumulation() -> Result<()> {
+    let Some(dev) = cudnn_device() else {
+        return Ok(());
+    };
+    let signal = |count: usize, scale: f32, phase: f32| {
+        (0..count)
+            .map(|i| ((i as f32 * 0.017) + phase).sin() * scale)
+            .collect::<Vec<_>>()
+    };
+    let x = Tensor::from_vec(signal(256 * 128 * 128, 1., 0.), (1, 256, 128, 128), &dev)?
+        .to_dtype(DType::F16)?;
+    let weight = Tensor::from_vec(signal(32 * 256 * 9, 0.05, 0.7), (32, 256, 3, 3), &dev)?
+        .to_dtype(DType::F16)?;
+    let (actual, reference) =
+        both_paths("F16 float accumulation", || x.conv2d(&weight, 1, 1, 1, 1))?;
+    assert_eq!(actual.dtype(), DType::F16);
+    let deviation = relative_deviation(&actual, &reference)?;
+    eprintln!("F16 cuDNN accumulation relative deviation: {deviation}");
+    assert!(
+        deviation <= 0.001,
+        "F16 convolution loses float accumulation: {deviation}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cudnn_f16_conv1d_preserves_float_accumulation() -> Result<()> {
+    let Some(dev) = cudnn_device() else {
+        return Ok(());
+    };
+    let signal = |count: usize, phase: f32| {
+        (0..count)
+            .map(|i| (i as f32 * 0.017 + phase).sin())
+            .collect::<Vec<_>>()
+    };
+    let x =
+        Tensor::from_vec(signal(128 * 60_000, 0.), (1, 128, 60_000), &dev)?.to_dtype(DType::F16)?;
+    let weight = (Tensor::from_vec(signal(32 * 128 * 5, 0.7), (32, 128, 5), &dev)? * 0.05)?
+        .to_dtype(DType::F16)?;
+    let (actual, reference) = both_paths("F16 Conv1D float accumulation", || {
+        x.conv1d(&weight, 2, 1, 1, 1)
+    })?;
+    assert_eq!(actual.dtype(), DType::F16);
+    let deviation = relative_deviation(&actual, &reference)?;
+    eprintln!("F16 Conv1D cuDNN accumulation relative deviation: {deviation}");
+    assert!(
+        deviation <= 0.001,
+        "F16 Conv1D loses float accumulation: {deviation}"
     );
     Ok(())
 }

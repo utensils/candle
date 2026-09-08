@@ -1900,7 +1900,10 @@ impl CudaStorage {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
                 let mut out = unsafe { device.alloc::<f16>(dst_el)? };
-                crate::cudnn::launch_conv1d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                // Half storage, float accumulation: PyTorch v2.5.1
+                // aten/src/ATen/cudnn/Descriptors.h:202-205. Tensor-op math
+                // alone does not promote the convolution compute descriptor.
+                crate::cudnn::launch_conv1d::<f16, f32>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
                 S::F16(out)
             }
@@ -2028,7 +2031,10 @@ impl CudaStorage {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
                 let mut out = unsafe { device.alloc::<f16>(dst_el)? };
-                crate::cudnn::launch_conv2d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                // Half storage, float accumulation: PyTorch v2.5.1
+                // aten/src/ATen/cudnn/Descriptors.h:202-205. Tensor-op math
+                // alone does not promote the convolution compute descriptor.
+                crate::cudnn::launch_conv2d::<f16, f32>(inp, inp_l, k, &mut out, params, &device)
                     .map_err(crate::Error::wrap)?;
                 S::F16(out)
             }
@@ -2425,7 +2431,12 @@ impl BackendStorage for CudaStorage {
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
         #[cfg(feature = "cudnn")]
-        if crate::cudnn_policy::is_enabled() && cudnn_is_worth_it_2d(params, self.dtype()) {
+        if crate::cudnn_policy::is_enabled()
+            && (params.cudnn_fwd_algo.is_some() || cudnn_is_worth_it_2d(params, self.dtype()))
+        {
+            // An explicit algorithm is also a numerical choice: the small
+            // im2col shortcut sums differently. Honor it below the automatic
+            // performance threshold, while preserving the thread policy.
             // No dispatch count here: this arm returns Ok even when it
             // handed a non-contiguous kernel to Candle's own Conv2D
             // kernel. `launch_conv2d` counts the launches cuDNN really ran.
